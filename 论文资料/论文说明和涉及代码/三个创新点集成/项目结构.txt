@@ -1,0 +1,24 @@
+ezns_rbc/
+├── include/
+│   ├── unified_metadata.h      # 统一元数据管理
+│   ├── frag_aware_balloon.h    # 碎片感知的zone ballooning
+│   ├── tenant_isolation.h       # 多租户碎片隔离
+│   ├── zone_arbiter.h          # zone仲裁器
+│   ├── io_scheduler.h          # I/O调度器
+│   └── common.h                # 公共定义
+├── src/
+│   ├── unified_metadata.cc     # 统一元数据实现
+│   ├── frag_aware_balloon.cc   # 碎片感知实现
+│   ├── tenant_isolation.cc      # 租户隔离实现
+│   ├── zone_arbiter.cc         # zone仲裁器实现
+│   ├── io_scheduler.cc         # I/O调度器实现
+│   └── main.cc                 # 测试主程序
+├── tests/
+│   ├── test_metadata.cc        # 元数据测试
+│   ├── test_frag_aware.cc      # 碎片感知测试
+│   └── test_tenant.cc          # 租户隔离测试
+├── benchmarks/
+│   ├── run_ycsb.cc             # YCSB负载测试
+│   └── run_db_bench.cc         # db_bench测试
+├── CMakeLists.txt
+└── README.md

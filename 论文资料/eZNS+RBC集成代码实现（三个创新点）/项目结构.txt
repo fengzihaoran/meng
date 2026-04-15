@@ -1,0 +1,20 @@
+ezns_rbc_integrated/
+├── include/
+│   ├── ezns_common.h          # eZNS公共定义
+│   ├── zone_arbiter.h         # eZNS Zone Arbiter
+│   ├── io_scheduler.h         # eZNS I/O调度器
+│   ├── rbc_remap.h            # RBC重映射表
+│   ├── rbc_reorg.h            # RBC重组管理器
+│   ├── rbc_compaction.h       # RBC动态压缩
+│   └── unified_controller.h   # 统一控制器（集成核心）
+├── src/
+│   ├── zone_arbiter.cpp
+│   ├── io_scheduler.cpp
+│   ├── rbc_remap.cpp
+│   ├── rbc_reorg.cpp
+│   ├── rbc_compaction.cpp
+│   └── unified_controller.cpp
+├── tests/
+│   └── test_integrated.cpp
+├── CMakeLists.txt
+└── README.md
