@@ -1597,3 +1597,39 @@ option(WITH_BENCHMARK "build benchmark tests" OFF)
 if(WITH_BENCHMARK)
   add_subdirectory(${PROJECT_SOURCE_DIR}/microbench/)
 endif()
+
+# Build ZenFS utility with CMake/CLion.
+# Output binary: ${CMAKE_BINARY_DIR}/zenfs
+# Also copy it to: ${PROJECT_SOURCE_DIR}/plugin/zenfs/util/zenfs
+option(WITH_ZENFS_TOOL "build ZenFS utility tool" ON)
+if(WITH_ZENFS_TOOL AND "${ROCKSDB_PLUGINS}" MATCHES "(^|[ ;])zenfs($|[ ;])")
+  add_executable(zenfs_tool
+          plugin/zenfs/util/zenfs.cc
+  )
+
+  set_target_properties(zenfs_tool PROPERTIES
+          OUTPUT_NAME "zenfs"
+          RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+          BUILD_RPATH "${CMAKE_BINARY_DIR}"
+  )
+
+  target_link_libraries(zenfs_tool
+          PRIVATE
+          ${ROCKSDB_LIB}
+          ${THIRDPARTY_LIBS}
+          ${SYSTEM_LIBS}
+  )
+
+  # After building zenfs, copy it back to plugin/zenfs/util/zenfs.
+  add_custom_command(TARGET zenfs_tool POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          $<TARGET_FILE:zenfs_tool>
+          ${PROJECT_SOURCE_DIR}/plugin/zenfs/util/zenfs
+          COMMENT "Copying zenfs tool to plugin/zenfs/util/zenfs"
+  )
+
+  # When building db_bench in CLion, also build zenfs_tool.
+  if(TARGET db_bench${ARTIFACT_SUFFIX})
+    add_dependencies(db_bench${ARTIFACT_SUFFIX} zenfs_tool)
+  endif()
+endif()
