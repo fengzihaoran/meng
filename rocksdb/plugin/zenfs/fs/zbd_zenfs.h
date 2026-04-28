@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -33,6 +34,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class ZonedBlockDevice;
 class ZonedBlockDeviceBackend;
+class FragmentationStateTable;
 class ZoneSnapshot;
 class ZenFSSnapshotOptions;
 
@@ -212,6 +214,15 @@ class ZonedBlockDevice {
   void SetZoneDeferredStatus(IOStatus status);
 
   std::shared_ptr<ZenFSMetrics> GetMetrics() { return metrics_; }
+  std::shared_ptr<FragmentationStateTable> GetFragmentationStateTable();
+
+  /* FACO CFSM hooks.  They are no-ops when FACO_ENABLE_CFSM=0, and they keep
+   * fragmentation accounting next to ZenFS' authoritative used_capacity_
+   * updates instead of observing raw zone writes that may include padding.
+   */
+  void NotifyFragmentationAppend(Zone *zone, uint64_t bytes);
+  void NotifyFragmentationDelete(Zone *zone, uint64_t bytes);
+  void NotifyFragmentationZoneReset(Zone *zone);
 
   void GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot);
 

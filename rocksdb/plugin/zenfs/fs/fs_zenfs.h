@@ -205,6 +205,8 @@ class ZenFS : public FileSystemWrapper {
     return superblock_->GetAuxFsPath() + path;
   }
 
+  void DumpFragmentationState();
+
   std::string ToZenFSPath(std::string aux_path) {
     std::string path = aux_path;
     path.erase(0, superblock_->GetAuxFsPath().length());

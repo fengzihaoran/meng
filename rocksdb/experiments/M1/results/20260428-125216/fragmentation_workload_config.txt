@@ -1,0 +1,5 @@
+M1 fragmentation workload:
+  FRAG_BENCHMARKS=fillrandom,overwrite,overwrite,compact,stats
+  NUM=1000000
+  VALUE_SIZE=1024
+  RESULT_DIR=/home/femu/rocksdb/experiments/M1/results/20260428-125216

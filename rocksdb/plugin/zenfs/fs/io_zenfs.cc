@@ -173,6 +173,7 @@ Status ZoneFile::DecodeFrom(Slice* input) {
         if (!extent->zone_)
           return Status::Corruption("ZoneFile", "Invalid zone extent");
         extent->zone_->used_capacity_ += extent->length_;
+        zbd_->NotifyFragmentationAppend(extent->zone_, extent->length_);
         extents_.push_back(extent);
         break;
       case kModificationTime:
@@ -225,6 +226,7 @@ Status ZoneFile::MergeUpdate(std::shared_ptr<ZoneFile> update, bool replace) {
     ZoneExtent* extent = update_extents[i];
     Zone* zone = extent->zone_;
     zone->used_capacity_ += extent->length_;
+    zbd_->NotifyFragmentationAppend(zone, extent->length_);
     extents_.push_back(new ZoneExtent(extent->start_, extent->length_, zone));
   }
   extent_start_ = update->GetExtentStart();
@@ -267,6 +269,7 @@ void ZoneFile::ClearExtents() {
 
     assert(zone && zone->used_capacity_ >= (*e)->length_);
     zone->used_capacity_ -= (*e)->length_;
+    zbd_->NotifyFragmentationDelete(zone, (*e)->length_);
     delete *e;
   }
   extents_.clear();
@@ -472,6 +475,7 @@ void ZoneFile::PushExtent() {
   extents_.push_back(new ZoneExtent(extent_start_, length, active_zone_));
 
   active_zone_->used_capacity_ += length;
+  zbd_->NotifyFragmentationAppend(active_zone_, length);
   extent_start_ = active_zone_->wp_;
   extent_filepos_ = file_size_;
 }
@@ -528,6 +532,7 @@ IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) {
 
     extent_start_ = active_zone_->wp_;
     active_zone_->used_capacity_ += extent_length;
+    zbd_->NotifyFragmentationAppend(active_zone_, extent_length);
     file_size_ += extent_length;
     left -= extent_length;
 
@@ -586,6 +591,7 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
 
     extent_start_ = active_zone_->wp_;
     active_zone_->used_capacity_ += extent_length;
+    zbd_->NotifyFragmentationAppend(active_zone_, extent_length);
     file_size_ += extent_length;
     left -= extent_length;
 
@@ -676,6 +682,7 @@ IOStatus ZoneFile::RecoverSparseExtents(uint64_t start, uint64_t end,
     recovered_segments++;
 
     zone->used_capacity_ += extent_length;
+    zbd_->NotifyFragmentationAppend(zone, extent_length);
     extents_.push_back(new ZoneExtent(next_extent_start + SPARSE_HEADER_SIZE,
                                       extent_length, zone));
 
@@ -725,6 +732,7 @@ IOStatus ZoneFile::Recover() {
     /* For non-sparse files, the data is contigous and we can recover directly
        any missing data using the WP */
     zone->used_capacity_ += to_recover;
+    zbd_->NotifyFragmentationAppend(zone, to_recover);
     extents_.push_back(new ZoneExtent(extent_start_, to_recover, zone));
   }
 

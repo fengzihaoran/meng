@@ -1,0 +1,8 @@
+M1 experiment config:
+  REPO_ROOT=/home/femu/rocksdb
+  ZBD=nvme0n1
+  ZENFS_AUX_PATH=/home/femu/mnt/zenfs_aux
+  DB_BENCH=/home/femu/rocksdb/cmake-build-release-cfsm-off/db_bench
+  ZENFS_TOOL=/home/femu/rocksdb/cmake-build-release-cfsm-off/zenfs
+  COMPRESSION_TYPE=none
+  RESULT_DIR=/home/femu/rocksdb/experiments/M1/results/20260428-123529/cfsm_off/run_7

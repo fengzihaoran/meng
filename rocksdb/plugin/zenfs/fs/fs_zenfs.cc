@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <fstream>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -24,6 +25,7 @@
 #ifdef ZENFS_EXPORT_PROMETHEUS
 #include "metrics_prometheus.h"
 #endif
+#include "frag_state_table.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "snapshot.h"
 #include "util/coding.h"
@@ -251,6 +253,29 @@ ZenFS::ZenFS(ZonedBlockDevice* zbd, std::shared_ptr<FileSystem> aux_fs,
   Info(logger_, "ZenFS initializing");
   next_file_id_ = 1;
   metadata_writer_.zenFS = this;
+
+  auto frag_table = zbd_->GetFragmentationStateTable();
+  if (frag_table != nullptr) {
+    // FFD needs the live file->zone extent view.  The callback stays in ZenFS
+    // so CFSM does not own or duplicate file metadata.
+    frag_table->SetFileZoneMapFn(
+        [this](const std::string& filename)
+            -> std::vector<std::pair<uint64_t, uint64_t>> {
+          std::vector<std::pair<uint64_t, uint64_t>> zones;
+          std::lock_guard<std::mutex> lock(files_mtx_);
+          std::shared_ptr<ZoneFile> zfile =
+              GetFileNoLock(FormatPathLexically(filename));
+          if (zfile == nullptr) return zones;
+
+          for (ZoneExtent* extent : zfile->GetExtents()) {
+            if (extent->zone_ != nullptr) {
+              zones.emplace_back(extent->zone_->GetZoneNr(),
+                                 extent->length_);
+            }
+          }
+          return zones;
+        });
+  }
 }
 
 ZenFS::~ZenFS() {
@@ -264,14 +289,55 @@ ZenFS::~ZenFS() {
     gc_worker_->join();
   }
 
+  DumpFragmentationState();
+
+  auto frag_table = zbd_->GetFragmentationStateTable();
+  if (frag_table != nullptr) {
+    frag_table->SetFileZoneMapFn(nullptr);
+  }
+
   meta_log_.reset(nullptr);
   ClearFiles();
   delete zbd_;
 }
 
+void ZenFS::DumpFragmentationState() {
+  auto frag_table = zbd_->GetFragmentationStateTable();
+  if (frag_table == nullptr || superblock_ == nullptr) {
+    return;
+  }
+
+  // Capture a final ZVDR/RBD snapshot at DB shutdown.  The files are written to
+  // aux storage so experiment scripts can copy them after db_bench exits.
+  frag_table->Tick(Env::Default()->NowMicros());
+  const std::string aux_path = superblock_->GetAuxFsPath();
+  const std::string summary_path = aux_path + "/faco_cfsm_summary.txt";
+  const std::string csv_path = aux_path + "/faco_cfsm_zones.csv";
+
+  std::ofstream summary(summary_path);
+  if (summary.good()) {
+    summary << frag_table->SummaryString(/*top_k=*/10);
+  } else {
+    Warn(logger_, "FACO CFSM: failed to write summary to %s",
+         summary_path.c_str());
+  }
+
+  std::ofstream csv(csv_path);
+  if (csv.good()) {
+    csv << frag_table->ExportCsv();
+  } else {
+    Warn(logger_, "FACO CFSM: failed to write zone CSV to %s",
+         csv_path.c_str());
+  }
+}
+
 void ZenFS::GCWorker() {
   while (run_gc_worker_) {
     usleep(1000 * 1000 * 10);
+    auto frag_table = zbd_->GetFragmentationStateTable();
+    if (frag_table != nullptr) {
+      frag_table->Tick(Env::Default()->NowMicros());
+    }
 
     uint64_t non_free = zbd_->GetUsedSpace() + zbd_->GetReclaimableSpace();
     uint64_t free = zbd_->GetFreeSpace();
@@ -496,6 +562,7 @@ IOStatus ZenFS::SyncFileExtents(ZoneFile* zoneFile,
     ZoneExtent* old_ext = old_extents[i];
     if (old_ext->start_ != new_extents[i]->start_) {
       old_ext->zone_->used_capacity_ -= old_ext->length_;
+      zbd_->NotifyFragmentationDelete(old_ext->zone_, old_ext->length_);
     }
     delete old_ext;
   }
@@ -1845,6 +1912,7 @@ IOStatus ZenFS::MigrateFileExtents(
     ext->start_ = target_start;
     ext->zone_ = target_zone;
     ext->zone_->used_capacity_ += ext->length_;
+    zbd_->NotifyFragmentationAppend(ext->zone_, ext->length_);
 
     zbd_->ReleaseMigrateZone(target_zone);
   }

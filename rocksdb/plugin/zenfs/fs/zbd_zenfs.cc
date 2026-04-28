@@ -24,9 +24,11 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "frag_state_table.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
 #include "snapshot.h"
@@ -47,6 +49,25 @@
 #define ZENFS_MIN_ZONES (32)
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+#if FACO_ENABLE_CFSM
+std::mutex& FragTablesMutex() {
+  static auto* mutex = new std::mutex();
+  return *mutex;
+}
+
+std::unordered_map<ZonedBlockDevice*, std::shared_ptr<FragmentationStateTable>>&
+FragTables() {
+  static auto* tables =
+      new std::unordered_map<ZonedBlockDevice*,
+                             std::shared_ptr<FragmentationStateTable>>();
+  return *tables;
+}
+#endif  // FACO_ENABLE_CFSM
+
+}  // namespace
 
 Zone::Zone(ZonedBlockDevice *zbd, ZonedBlockDeviceBackend *zbd_be,
            std::unique_ptr<ZoneList> &zones, unsigned int idx)
@@ -97,6 +118,7 @@ IOStatus Zone::Reset() {
 
   wp_ = start_;
   lifetime_ = Env::WLTH_NOT_SET;
+  zbd_->NotifyFragmentationZoneReset(this);
 
   return IOStatus::OK();
 }
@@ -267,8 +289,73 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   }
 
   start_time_ = time(NULL);
+#if FACO_ENABLE_CFSM
+  {
+    std::lock_guard<std::mutex> lock(FragTablesMutex());
+    auto frag_table = std::make_shared<FragmentationStateTable>(
+        zbd_be_->GetZoneSize(), zbd_be_->GetNrZones());
+    // Establish an initial time reference before any writes happen.  Without
+    // this first sample, a final shutdown Tick would only initialize ZVDR
+    // history and miss validity decay caused by overwrites/compaction.
+    frag_table->Tick(Env::Default()->NowMicros());
+    FragTables()[this] = frag_table;
+  }
+#endif
 
   return IOStatus::OK();
+}
+
+std::shared_ptr<FragmentationStateTable>
+ZonedBlockDevice::GetFragmentationStateTable() {
+#if FACO_ENABLE_CFSM
+  std::lock_guard<std::mutex> lock(FragTablesMutex());
+  auto it = FragTables().find(this);
+  if (it == FragTables().end()) {
+    return nullptr;
+  }
+  return it->second;
+#else
+  return nullptr;
+#endif
+}
+
+void ZonedBlockDevice::NotifyFragmentationAppend(Zone *zone, uint64_t bytes) {
+#if FACO_ENABLE_CFSM
+  auto frag_table = GetFragmentationStateTable();
+  if (frag_table != nullptr && zone != nullptr) {
+    frag_table->OnAppend(zone->GetZoneNr(), bytes);
+  }
+#else
+  (void)zone;
+  (void)bytes;
+#endif
+}
+
+void ZonedBlockDevice::NotifyFragmentationDelete(Zone *zone, uint64_t bytes) {
+#if FACO_ENABLE_CFSM
+  auto frag_table = GetFragmentationStateTable();
+  if (frag_table != nullptr && zone != nullptr) {
+    frag_table->OnDelete(zone->GetZoneNr(), bytes);
+    // ZenFS can reset a fully invalid zone before the periodic GC worker runs.
+    // Sample ZVDR immediately on invalidation so short-lived decay is preserved
+    // for experiments even when ZenFS GC is disabled.
+    frag_table->Tick(Env::Default()->NowMicros());
+  }
+#else
+  (void)zone;
+  (void)bytes;
+#endif
+}
+
+void ZonedBlockDevice::NotifyFragmentationZoneReset(Zone *zone) {
+#if FACO_ENABLE_CFSM
+  auto frag_table = GetFragmentationStateTable();
+  if (frag_table != nullptr && zone != nullptr) {
+    frag_table->OnZoneReset(zone->GetZoneNr());
+  }
+#else
+  (void)zone;
+#endif
 }
 
 uint64_t ZonedBlockDevice::GetFreeSpace() {
@@ -381,6 +468,13 @@ void ZonedBlockDevice::LogGarbageInfo() {
 }
 
 ZonedBlockDevice::~ZonedBlockDevice() {
+#if FACO_ENABLE_CFSM
+  {
+    std::lock_guard<std::mutex> lock(FragTablesMutex());
+    FragTables().erase(this);
+  }
+#endif
+
   for (const auto z : meta_zones) {
     delete z;
   }
