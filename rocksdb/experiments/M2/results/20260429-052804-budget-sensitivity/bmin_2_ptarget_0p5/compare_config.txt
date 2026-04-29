@@ -1,0 +1,17 @@
+M1 experiment config:
+  REPO_ROOT=/home/femu/rocksdb
+  ZBD=nvme0n1
+  ZENFS_AUX_PATH=/home/femu/mnt/zenfs_aux
+  DB_BENCH=/home/femu/rocksdb/cmake-build-release/db_bench
+  ZENFS_TOOL=/home/femu/rocksdb/cmake-build-release/zenfs
+  BENCHMARKS=fillrandom
+  COMPRESSION_TYPE=none
+  ZENFS_ENABLE_GC=1
+  EXTRA_DB_BENCH_ARGS=
+  RESULT_DIR=/home/femu/rocksdb/experiments/M2/results/20260429-052804-budget-sensitivity/bmin_2_ptarget_0p5
+  COMPARE_RUNS=1
+  M2_BENCHMARKS=fillrandom,overwrite,overwrite,stats
+  BUILD_ON_DIR=/home/femu/rocksdb/cmake-build-release-budget-on
+  BUILD_OFF_DIR=/home/femu/rocksdb/cmake-build-release-budget-off
+  RUN_BUDGET_ON=1
+  RUN_BUDGET_OFF=0

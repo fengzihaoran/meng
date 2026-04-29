@@ -1,0 +1,4 @@
+variant,budget_enabled,run,benchmark,micros_per_op,ops_per_sec,seconds,mb_per_sec,result_dir
+budget_on,1,1,fillrandom,6.415,155886,32.075,154.6,/home/femu/rocksdb/experiments/M2/results/20260429-052804-budget-sensitivity/bmin_2_ptarget_0p5/budget_on/run_1
+budget_on,1,1,overwrite,8.276,120830,41.380,119.8,/home/femu/rocksdb/experiments/M2/results/20260429-052804-budget-sensitivity/bmin_2_ptarget_0p5/budget_on/run_1
+budget_on,1,1,overwrite,10.533,94936,52.667,94.2,/home/femu/rocksdb/experiments/M2/results/20260429-052804-budget-sensitivity/bmin_2_ptarget_0p5/budget_on/run_1

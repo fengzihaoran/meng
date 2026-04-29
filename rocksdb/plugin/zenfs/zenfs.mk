@@ -4,6 +4,7 @@ zenfs_SOURCES-y = \
 	fs/zbd_zenfs.cc \
 	fs/io_zenfs.cc \
 	fs/frag_state_table.cc \
+	fs/zone_budget_ctrl.cc \
 	fs/zonefs_zenfs.cc \
 	fs/zbdlib_zenfs.cc
 
@@ -16,11 +17,13 @@ zenfs_HEADERS-y = \
 	fs/snapshot.h \
 	fs/filesystem_utility.h \
 	fs/frag_state_table.h \
+	fs/zone_budget_ctrl.h \
 	fs/zonefs_zenfs.h \
 	fs/zbdlib_zenfs.h
 
 zenfs_TESTS-y = \
-	tests/frag_state_table_test.cc
+	tests/frag_state_table_test.cc \
+	tests/zone_budget_ctrl_test.cc
 
 zenfs_PKGCONFIG_REQUIRES-y += "libzbd >= 1.5.0"
 

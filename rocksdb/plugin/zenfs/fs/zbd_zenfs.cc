@@ -18,6 +18,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -33,6 +34,7 @@
 #include "rocksdb/io_status.h"
 #include "snapshot.h"
 #include "zbdlib_zenfs.h"
+#include "zone_budget_ctrl.h"
 #include "zonefs_zenfs.h"
 
 #define KB (1024)
@@ -66,6 +68,62 @@ FragTables() {
   return *tables;
 }
 #endif  // FACO_ENABLE_CFSM
+
+#if FACO_ENABLE_BUDGET && FACO_ENABLE_CFSM
+int ReadEnvInt(const char* name, int default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') return default_value;
+  char* end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  if (end == value) return default_value;
+  return static_cast<int>(parsed);
+}
+
+uint64_t ReadEnvUint64(const char* name, uint64_t default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') return default_value;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (end == value) return default_value;
+  return static_cast<uint64_t>(parsed);
+}
+
+float ReadEnvFloat(const char* name, float default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') return default_value;
+  char* end = nullptr;
+  const float parsed = std::strtof(value, &end);
+  if (end == value) return default_value;
+  return parsed;
+}
+
+size_t ReadEnvSize(const char* name, size_t default_value) {
+  const int parsed = ReadEnvInt(name, static_cast<int>(default_value));
+  return parsed <= 0 ? default_value : static_cast<size_t>(parsed);
+}
+
+ZoneBudgetCtrl::Config LoadZoneBudgetConfig(unsigned int hard_limit) {
+  ZoneBudgetCtrl::Config cfg;
+  cfg.B_min = ReadEnvInt("FACO_BUDGET_B_MIN", cfg.B_min);
+  cfg.B_max = ReadEnvInt("FACO_BUDGET_B_MAX", cfg.B_max);
+  cfg.Kp = ReadEnvFloat("FACO_BUDGET_KP", cfg.Kp);
+  cfg.Ki = ReadEnvFloat("FACO_BUDGET_KI", cfg.Ki);
+  cfg.P_target = ReadEnvFloat("FACO_BUDGET_P_TARGET", cfg.P_target);
+  cfg.theta_zvdr = ReadEnvFloat("FACO_BUDGET_THETA_ZVDR", cfg.theta_zvdr);
+  cfg.update_interval_us = ReadEnvUint64(
+      "FACO_BUDGET_UPDATE_INTERVAL_US", cfg.update_interval_us);
+  cfg.top_k = ReadEnvSize("FACO_BUDGET_TOP_K", cfg.top_k);
+  cfg.rbd_threshold =
+      ReadEnvFloat("FACO_BUDGET_RBD_THRESHOLD", cfg.rbd_threshold);
+  cfg.rbd_weight = ReadEnvFloat("FACO_BUDGET_RBD_WEIGHT", cfg.rbd_weight);
+  cfg.zvdr_weight = ReadEnvFloat("FACO_BUDGET_ZVDR_WEIGHT", cfg.zvdr_weight);
+
+  const int hard_limit_int = std::max(1, static_cast<int>(hard_limit));
+  cfg.B_max = std::min(cfg.B_max, hard_limit_int);
+  cfg.B_min = std::min(cfg.B_min, cfg.B_max);
+  return cfg;
+}
+#endif  // FACO_ENABLE_BUDGET && FACO_ENABLE_CFSM
 
 }  // namespace
 
@@ -118,6 +176,7 @@ IOStatus Zone::Reset() {
 
   wp_ = start_;
   lifetime_ = Env::WLTH_NOT_SET;
+  zbd_->AddZoneReset();
   zbd_->NotifyFragmentationZoneReset(this);
 
   return IOStatus::OK();
@@ -131,6 +190,7 @@ IOStatus Zone::Finish() {
 
   capacity_ = 0;
   wp_ = start_ + zbd_->GetZoneSize();
+  zbd_->AddZoneFinish();
 
   return IOStatus::OK();
 }
@@ -194,8 +254,11 @@ Zone *ZonedBlockDevice::GetIOZone(uint64_t offset) {
 
 ZonedBlockDevice::ZonedBlockDevice(std::string path, ZbdBackendType backend,
                                    std::shared_ptr<Logger> logger,
-                                   std::shared_ptr<ZenFSMetrics> metrics)
-    : logger_(logger), metrics_(metrics) {
+                                   std::shared_ptr<ZenFSMetrics> metrics,
+                                   bool enable_faco_runtime)
+    : logger_(logger),
+      faco_runtime_enabled_(enable_faco_runtime),
+      metrics_(metrics) {
   if (backend == ZbdBackendType::kBlockDev) {
     zbd_be_ = std::unique_ptr<ZbdlibBackend>(new ZbdlibBackend(path));
     Info(logger_, "New Zoned Block Device: %s", zbd_be_->GetFilename().c_str());
@@ -290,7 +353,7 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
 
   start_time_ = time(NULL);
 #if FACO_ENABLE_CFSM
-  {
+  if (faco_runtime_enabled_) {
     std::lock_guard<std::mutex> lock(FragTablesMutex());
     auto frag_table = std::make_shared<FragmentationStateTable>(
         zbd_be_->GetZoneSize(), zbd_be_->GetNrZones());
@@ -308,6 +371,9 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
 std::shared_ptr<FragmentationStateTable>
 ZonedBlockDevice::GetFragmentationStateTable() {
 #if FACO_ENABLE_CFSM
+  if (!faco_runtime_enabled_) {
+    return nullptr;
+  }
   std::lock_guard<std::mutex> lock(FragTablesMutex());
   auto it = FragTables().find(this);
   if (it == FragTables().end()) {
@@ -317,6 +383,71 @@ ZonedBlockDevice::GetFragmentationStateTable() {
 #else
   return nullptr;
 #endif
+}
+
+void ZonedBlockDevice::EnableZoneBudget() {
+#if FACO_ENABLE_BUDGET && FACO_ENABLE_CFSM
+  if (budget_ctrl_ != nullptr) {
+    return;
+  }
+
+  auto frag_table = GetFragmentationStateTable();
+  if (frag_table == nullptr) {
+    return;
+  }
+
+  ZoneBudgetCtrl::Config budget_cfg =
+      LoadZoneBudgetConfig(max_nr_active_io_zones_);
+  budget_ctrl_.reset(new ZoneBudgetCtrl(budget_cfg, frag_table.get()));
+  Info(logger_,
+       "FACO budget controller enabled: B_min=%d B_max=%d top_k=%zu "
+       "rbd_threshold=%f zvdr_weight=%f",
+       budget_cfg.B_min, budget_cfg.B_max, budget_cfg.top_k,
+       budget_cfg.rbd_threshold, budget_cfg.zvdr_weight);
+#endif
+}
+
+void ZonedBlockDevice::UpdateZoneBudget(uint64_t now_us) {
+#if FACO_ENABLE_BUDGET && FACO_ENABLE_CFSM
+  if (budget_ctrl_ != nullptr) {
+    budget_ctrl_->Update(now_us);
+  }
+#else
+  (void)now_us;
+#endif
+}
+
+std::string ZonedBlockDevice::GetZoneBudgetDebugString() {
+#if FACO_ENABLE_BUDGET && FACO_ENABLE_CFSM
+  if (budget_ctrl_ != nullptr) {
+    return budget_ctrl_->DebugString();
+  }
+#endif
+  return "";
+}
+
+std::string ZonedBlockDevice::ExportZoneBudgetTraceCsv() {
+#if FACO_ENABLE_BUDGET && FACO_ENABLE_CFSM
+  if (budget_ctrl_ != nullptr) {
+    return budget_ctrl_->ExportTraceCsv();
+  }
+#endif
+  return "";
+}
+
+std::string ZonedBlockDevice::ExportRuntimeMetricsString() const {
+  std::ostringstream oss;
+  const uint64_t total_bytes = bytes_written_.load();
+  const uint64_t gc_bytes = gc_bytes_written_.load();
+  const uint64_t user_bytes =
+      total_bytes >= gc_bytes ? total_bytes - gc_bytes : 0;
+
+  oss << "zone_reset_count=" << zone_reset_count_.load() << "\n";
+  oss << "zone_finish_count=" << zone_finish_count_.load() << "\n";
+  oss << "bytes_written=" << total_bytes << "\n";
+  oss << "gc_bytes_written=" << gc_bytes << "\n";
+  oss << "user_bytes_written=" << user_bytes << "\n";
+  return oss.str();
 }
 
 void ZonedBlockDevice::NotifyFragmentationAppend(Zone *zone, uint64_t bytes) {
@@ -469,7 +600,8 @@ void ZonedBlockDevice::LogGarbageInfo() {
 
 ZonedBlockDevice::~ZonedBlockDevice() {
 #if FACO_ENABLE_CFSM
-  {
+  budget_ctrl_.reset();
+  if (faco_runtime_enabled_) {
     std::lock_guard<std::mutex> lock(FragTablesMutex());
     FragTables().erase(this);
   }
@@ -577,13 +709,21 @@ void ZonedBlockDevice::WaitForOpenIOZoneToken(bool prioritized) {
   });
 }
 
-bool ZonedBlockDevice::GetActiveIOZoneTokenIfAvailable() {
+bool ZonedBlockDevice::GetActiveIOZoneTokenIfAvailable(bool respect_budget) {
   /* Grap an active IO Zone token if available - after this function returns
    * the caller is allowed to write to a closed zone. The callee
    * is responsible for calling a PutActiveIOZoneToken to return the resource
    */
   std::unique_lock<std::mutex> lk(zone_resources_mtx_);
-  if (active_io_zones_.load() < max_nr_active_io_zones_) {
+  long active_limit = max_nr_active_io_zones_;
+#if FACO_ENABLE_BUDGET && FACO_ENABLE_CFSM
+  if (respect_budget && budget_ctrl_ != nullptr) {
+    active_limit =
+        std::min(active_limit,
+                 static_cast<long>(budget_ctrl_->GetCurrentAllocBudget()));
+  }
+#endif
+  if (active_io_zones_.load() < active_limit) {
     active_io_zones_++;
     return true;
   }
@@ -878,10 +1018,20 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
     if (allocated_zone == nullptr) {
       /* We have to make sure we can open an empty zone */
       while (!got_token && !GetActiveIOZoneTokenIfAvailable()) {
+        const long active_before_finish = active_io_zones_.load();
         s = FinishCheapestIOZone();
         if (!s.ok()) {
           PutOpenIOZoneToken();
           return s;
+        }
+        if (active_io_zones_.load() >= active_before_finish) {
+          // Budget is a soft control plane. If there is no currently
+          // finishable zone, fall back to the device hard limit so foreground
+          // allocation cannot spin forever below a shrunken budget.
+          if (GetActiveIOZoneTokenIfAvailable(/*respect_budget=*/false)) {
+            break;
+          }
+          usleep(1000);
         }
       }
 

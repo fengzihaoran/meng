@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="320" viewBox="0 0 900 320">
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <line x1="56" y1="24" x2="56" y2="276" stroke="#222" stroke-width="1"/>
+  <line x1="56" y1="276" x2="876" y2="276" stroke="#222" stroke-width="1"/>
+  <polyline points="56.00,24.00 107.25,45.00 158.50,45.00 209.75,66.00 261.00,66.00 312.25,66.00 363.50,87.00 414.75,87.00 466.00,108.00 517.25,129.00 568.50,129.00 619.75,150.00 671.00,171.00 722.25,171.00 773.50,192.00 824.75,213.00 876.00,213.00" fill="none" stroke="#0b6e4f" stroke-width="2.5"/>
+  <polyline points="56.00,153.32 107.25,145.47 158.50,141.06 209.75,141.31 261.00,147.96 312.25,145.00 363.50,151.66 414.75,138.22 466.00,135.84 517.25,143.74 568.50,138.15 619.75,135.52 671.00,134.66 722.25,135.85 773.50,134.40 824.75,136.63 876.00,144.09" fill="none" stroke="#b13f2a" stroke-width="2" stroke-dasharray="5 4"/>
+  <text x="56" y="18" font-family="sans-serif" font-size="13" fill="#0b6e4f">budget</text>
+  <text x="132" y="18" font-family="sans-serif" font-size="13" fill="#b13f2a">p_frag</text>
+  <text x="56" y="308" font-family="sans-serif" font-size="12" fill="#333">samples: 17</text>
+</svg>

@@ -1,0 +1,4 @@
+run_dir,samples,min_budget,max_budget,last_budget,avg_p_frag,max_p_frag
+experiments\M2\results\20260429-025838\budget_on\run_1,19,2,12,2,0.521622,0.558276
+experiments\M2\results\20260429-025838\budget_on\run_2,18,2,12,2,0.524253,0.566821
+experiments\M2\results\20260429-025838\budget_on\run_3,18,2,12,2,0.510277,0.557786

@@ -1,0 +1,1 @@
+ZoneBudgetCtrl{budget=12, B_min=6, B_max=12, p_frag=0.54731, avg_rbd=0.569945, max_rbd=0.599995, trend_pressure=0, victim_count=8, integral=-0.366303}

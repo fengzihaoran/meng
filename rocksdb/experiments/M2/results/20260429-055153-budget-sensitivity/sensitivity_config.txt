@@ -1,0 +1,10 @@
+M2 sensitivity config:
+  REPO_ROOT=/home/femu/rocksdb
+  RESULT_DIR=/home/femu/rocksdb/experiments/M2/results/20260429-055153-budget-sensitivity
+  B_MIN_LIST=2 6
+  P_TARGET_LIST=0 0.5
+  COMPARE_RUNS=1
+  NUM=5000000
+  VALUE_SIZE=1024
+  RUN_BASELINE=1
+  ZBD=nvme0n1

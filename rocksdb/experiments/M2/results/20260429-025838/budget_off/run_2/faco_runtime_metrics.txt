@@ -1,0 +1,5 @@
+zone_reset_count=299
+zone_finish_count=1
+bytes_written=73058480640
+gc_bytes_written=0
+user_bytes_written=73058480640

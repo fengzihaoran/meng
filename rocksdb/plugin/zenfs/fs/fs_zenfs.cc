@@ -309,10 +309,17 @@ void ZenFS::DumpFragmentationState() {
 
   // Capture a final ZVDR/RBD snapshot at DB shutdown.  The files are written to
   // aux storage so experiment scripts can copy them after db_bench exits.
-  frag_table->Tick(Env::Default()->NowMicros());
+  const uint64_t now_us = Env::Default()->NowMicros();
+  frag_table->Tick(now_us);
+  zbd_->UpdateZoneBudget(now_us);
   const std::string aux_path = superblock_->GetAuxFsPath();
   const std::string summary_path = aux_path + "/faco_cfsm_summary.txt";
   const std::string csv_path = aux_path + "/faco_cfsm_zones.csv";
+  const std::string budget_summary_path =
+      aux_path + "/faco_budget_summary.txt";
+  const std::string budget_trace_path = aux_path + "/faco_budget_trace.csv";
+  const std::string runtime_metrics_path =
+      aux_path + "/faco_runtime_metrics.txt";
 
   std::ofstream summary(summary_path);
   if (summary.good()) {
@@ -329,15 +336,47 @@ void ZenFS::DumpFragmentationState() {
     Warn(logger_, "FACO CFSM: failed to write zone CSV to %s",
          csv_path.c_str());
   }
+
+  const std::string budget_summary = zbd_->GetZoneBudgetDebugString();
+  if (!budget_summary.empty()) {
+    std::ofstream budget_summary_file(budget_summary_path);
+    if (budget_summary_file.good()) {
+      budget_summary_file << budget_summary << "\n";
+    } else {
+      Warn(logger_, "FACO budget: failed to write summary to %s",
+           budget_summary_path.c_str());
+    }
+  }
+
+  const std::string budget_trace = zbd_->ExportZoneBudgetTraceCsv();
+  if (!budget_trace.empty()) {
+    std::ofstream budget_trace_file(budget_trace_path);
+    if (budget_trace_file.good()) {
+      budget_trace_file << budget_trace;
+    } else {
+      Warn(logger_, "FACO budget: failed to write trace to %s",
+           budget_trace_path.c_str());
+    }
+  }
+
+  std::ofstream runtime_metrics(runtime_metrics_path);
+  if (runtime_metrics.good()) {
+    runtime_metrics << zbd_->ExportRuntimeMetricsString();
+  } else {
+    Warn(logger_, "FACO runtime: failed to write metrics to %s",
+         runtime_metrics_path.c_str());
+  }
 }
 
 void ZenFS::GCWorker() {
   while (run_gc_worker_) {
     usleep(1000 * 1000 * 10);
+    const uint64_t now_us = Env::Default()->NowMicros();
     auto frag_table = zbd_->GetFragmentationStateTable();
     if (frag_table != nullptr) {
-      frag_table->Tick(Env::Default()->NowMicros());
+      frag_table->Tick(now_us);
     }
+    zbd_->UpdateZoneBudget(now_us);
 
     uint64_t non_free = zbd_->GetUsedSpace() + zbd_->GetReclaimableSpace();
     uint64_t free = zbd_->GetFreeSpace();
@@ -1678,7 +1717,8 @@ Status NewZenFS(FileSystem** fs, const ZbdBackendType backend_type,
 #endif
 
   ZonedBlockDevice* zbd =
-      new ZonedBlockDevice(backend_name, backend_type, logger, metrics);
+      new ZonedBlockDevice(backend_name, backend_type, logger, metrics,
+                           /*enable_faco_runtime=*/true);
   IOStatus zbd_status = zbd->Open(false, true);
   if (!zbd_status.ok()) {
     Error(logger, "mkfs: Failed to open zoned block device: %s",
@@ -1692,6 +1732,7 @@ Status NewZenFS(FileSystem** fs, const ZbdBackendType backend_type,
     delete zenFS;
     return s;
   }
+  zbd->EnableZoneBudget();
 
   *fs = zenFS;
   return Status::OK();

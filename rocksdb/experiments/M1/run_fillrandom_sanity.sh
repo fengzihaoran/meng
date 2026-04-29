@@ -70,10 +70,34 @@ if [[ -n "${EXTRA_DB_BENCH_ARGS:-}" ]]; then
   DB_BENCH_ARGS+=("${EXTRA_ARGS[@]}")
 fi
 
+FACO_DB_BENCH_ENV=()
+for env_name in \
+  FACO_BUDGET_B_MIN \
+  FACO_BUDGET_B_MAX \
+  FACO_BUDGET_KP \
+  FACO_BUDGET_KI \
+  FACO_BUDGET_P_TARGET \
+  FACO_BUDGET_THETA_ZVDR \
+  FACO_BUDGET_UPDATE_INTERVAL_US \
+  FACO_BUDGET_TOP_K \
+  FACO_BUDGET_RBD_THRESHOLD \
+  FACO_BUDGET_RBD_WEIGHT \
+  FACO_BUDGET_ZVDR_WEIGHT; do
+  env_value="${!env_name-}"
+  if [[ -n "${env_value}" ]]; then
+    FACO_DB_BENCH_ENV+=("${env_name}=${env_value}")
+  fi
+done
+
 # Use NoCompression by default so M1 measures ZenFS/CFSM behavior without being
 # affected by optional Snappy linkage or CPU compression cost.
-run_sudo "${DB_BENCH}" "${DB_BENCH_ARGS[@]}" \
-  2>&1 | tee "${RESULT_DIR}/db_bench.log"
+if [[ "${#FACO_DB_BENCH_ENV[@]}" -gt 0 ]]; then
+  run_sudo env "${FACO_DB_BENCH_ENV[@]}" "${DB_BENCH}" "${DB_BENCH_ARGS[@]}" \
+    2>&1 | tee "${RESULT_DIR}/db_bench.log"
+else
+  run_sudo "${DB_BENCH}" "${DB_BENCH_ARGS[@]}" \
+    2>&1 | tee "${RESULT_DIR}/db_bench.log"
+fi
 
 # ZenFS writes CFSM exports to aux storage during shutdown. Copy them into the
 # run directory before the next run has a chance to clean the aux path.

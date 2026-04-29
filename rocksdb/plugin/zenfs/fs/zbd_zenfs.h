@@ -35,6 +35,7 @@ namespace ROCKSDB_NAMESPACE {
 class ZonedBlockDevice;
 class ZonedBlockDeviceBackend;
 class FragmentationStateTable;
+class ZoneBudgetCtrl;
 class ZoneSnapshot;
 class ZenFSSnapshotOptions;
 
@@ -148,9 +149,12 @@ class ZonedBlockDevice {
   std::vector<Zone *> meta_zones;
   time_t start_time_;
   std::shared_ptr<Logger> logger_;
+  bool faco_runtime_enabled_;
   uint32_t finish_threshold_ = 0;
   std::atomic<uint64_t> bytes_written_{0};
   std::atomic<uint64_t> gc_bytes_written_{0};
+  std::atomic<uint64_t> zone_reset_count_{0};
+  std::atomic<uint64_t> zone_finish_count_{0};
 
   std::atomic<long> active_io_zones_;
   std::atomic<long> open_io_zones_;
@@ -169,6 +173,7 @@ class ZonedBlockDevice {
   unsigned int max_nr_open_io_zones_;
 
   std::shared_ptr<ZenFSMetrics> metrics_;
+  std::unique_ptr<ZoneBudgetCtrl> budget_ctrl_;
 
   void EncodeJsonZone(std::ostream &json_stream,
                       const std::vector<Zone *> zones);
@@ -177,7 +182,8 @@ class ZonedBlockDevice {
   explicit ZonedBlockDevice(std::string path, ZbdBackendType backend,
                             std::shared_ptr<Logger> logger,
                             std::shared_ptr<ZenFSMetrics> metrics =
-                                std::make_shared<NoZenFSMetrics>());
+                                std::make_shared<NoZenFSMetrics>(),
+                            bool enable_faco_runtime = false);
   virtual ~ZonedBlockDevice();
 
   IOStatus Open(bool readonly, bool exclusive);
@@ -215,6 +221,10 @@ class ZonedBlockDevice {
 
   std::shared_ptr<ZenFSMetrics> GetMetrics() { return metrics_; }
   std::shared_ptr<FragmentationStateTable> GetFragmentationStateTable();
+  void EnableZoneBudget();
+  void UpdateZoneBudget(uint64_t now_us);
+  std::string GetZoneBudgetDebugString();
+  std::string ExportZoneBudgetTraceCsv();
 
   /* FACO CFSM hooks.  They are no-ops when FACO_ENABLE_CFSM=0, and they keep
    * fragmentation accounting next to ZenFS' authoritative used_capacity_
@@ -236,14 +246,17 @@ class ZonedBlockDevice {
 
   void AddBytesWritten(uint64_t written) { bytes_written_ += written; };
   void AddGCBytesWritten(uint64_t written) { gc_bytes_written_ += written; };
+  void AddZoneReset() { zone_reset_count_++; };
+  void AddZoneFinish() { zone_finish_count_++; };
   uint64_t GetUserBytesWritten() {
     return bytes_written_.load() - gc_bytes_written_.load();
   };
   uint64_t GetTotalBytesWritten() { return bytes_written_.load(); };
+  std::string ExportRuntimeMetricsString() const;
 
  private:
   IOStatus GetZoneDeferredStatus();
-  bool GetActiveIOZoneTokenIfAvailable();
+  bool GetActiveIOZoneTokenIfAvailable(bool respect_budget = true);
   void WaitForOpenIOZoneToken(bool prioritized);
   IOStatus ApplyFinishThreshold();
   IOStatus FinishCheapestIOZone();

@@ -1,0 +1,5 @@
+scenario,run_dir,samples,min_budget,max_budget,last_budget,avg_p_frag,max_p_frag
+bmin_2_ptarget_0,/home/femu/rocksdb/experiments/M2/results/20260429-055153-budget-sensitivity/bmin_2_ptarget_0/budget_on/run_1,17,3,12,3,0.534345,0.561897
+bmin_2_ptarget_0p5,/home/femu/rocksdb/experiments/M2/results/20260429-055153-budget-sensitivity/bmin_2_ptarget_0p5/budget_on/run_1,15,12,12,12,0.521263,0.554811
+bmin_6_ptarget_0,/home/femu/rocksdb/experiments/M2/results/20260429-055153-budget-sensitivity/bmin_6_ptarget_0/budget_on/run_1,15,6,12,6,0.515869,0.549419
+bmin_6_ptarget_0p5,/home/femu/rocksdb/experiments/M2/results/20260429-055153-budget-sensitivity/bmin_6_ptarget_0p5/budget_on/run_1,14,12,12,12,0.526165,0.554105

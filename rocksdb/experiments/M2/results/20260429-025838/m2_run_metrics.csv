@@ -1,0 +1,7 @@
+variant,run,run_dir,active_zones,empty_zones,high_fragment_zones,total_valid_bytes,zone_reset_count,zone_finish_count,bytes_written,gc_bytes_written,user_bytes_written
+budget_off,run_1,experiments\M2\results\20260429-025838\budget_off\run_1,95,105,84,7141291078,300,1,73751017472,0,73751017472
+budget_off,run_2,experiments\M2\results\20260429-025838\budget_off\run_2,92,108,79,6854507316,299,1,73058480640,0,73058480640
+budget_off,run_3,experiments\M2\results\20260429-025838\budget_off\run_3,98,102,86,7003699237,276,1,73510348800,0,73510348800
+budget_on,run_1,experiments\M2\results\20260429-025838\budget_on\run_1,42,158,17,6992813050,293,19,73764230144,0,73764230144
+budget_on,run_2,experiments\M2\results\20260429-025838\budget_on\run_2,46,154,22,7093305438,289,19,73182949888,0,73182949888
+budget_on,run_3,experiments\M2\results\20260429-025838\budget_on\run_3,42,158,15,7100013777,289,13,74018350592,0,74018350592

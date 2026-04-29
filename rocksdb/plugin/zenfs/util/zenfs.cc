@@ -162,21 +162,25 @@ int zenfs_tool_mkfs() {
 
   if (create_aux_dir(FLAGS_aux_path.c_str())) return 1;
 
-  std::unique_ptr<ZonedBlockDevice> zbd = zbd_open(false, true);
-  if (!zbd) return 1;
-
+  std::unique_ptr<ZonedBlockDevice> zbd;
   std::unique_ptr<ZenFS> zenFS;
-  s = zenfs_mount(zbd, &zenFS, false);
-  if ((s.ok() || !s.IsNotFound()) && !FLAGS_force) {
-    fprintf(
-        stderr,
-        "Existing filesystem found, use --force if you want to replace it.\n");
-    return 1;
+
+  if (!FLAGS_force) {
+    zbd = zbd_open(false, true);
+    if (!zbd) return 1;
+
+    s = zenfs_mount(zbd, &zenFS, false);
+    if (s.ok() || !s.IsNotFound()) {
+      fprintf(stderr,
+              "Existing filesystem found, use --force if you want to "
+              "replace it.\n");
+      return 1;
+    }
+    zenFS.reset();
   }
 
-  zenFS.reset();
-
   zbd = zbd_open(false, true);
+  if (!zbd) return 1;
   ZonedBlockDevice *zbdRaw = zbd.get();
   zenFS.reset(new ZenFS(zbd.release(), FileSystem::Default(), nullptr));
 
@@ -745,14 +749,7 @@ int zenfs_tool_dump() {
             s.ToString().c_str());
     return 1;
   }
-//
-  IOStatus io_s = zbdRaw->LoadPECycles();
-  if (!io_s.ok()) {
-    fprintf(stderr, "Failed to load pe cycles, error: %s\n",
-            io_s.ToString().c_str());
-    return 1;
-  }
-//
+
   std::ostream &json_stream = std::cout;
   json_stream << "{\"zones\":";
   zbdRaw->EncodeJson(json_stream);

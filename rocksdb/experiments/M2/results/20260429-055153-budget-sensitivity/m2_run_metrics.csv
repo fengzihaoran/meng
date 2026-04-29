@@ -1,0 +1,6 @@
+scenario,variant,run,run_dir,active_zones,empty_zones,high_fragment_zones,total_valid_bytes,zone_reset_count,zone_finish_count,bytes_written,gc_bytes_written,user_bytes_written
+baseline_budget_off,budget_off,run_1,/home/femu/rocksdb/experiments/M2/results/20260429-055153-budget-sensitivity/baseline_budget_off/budget_off/run_1,92,108,81,6875462682,325,1,74740982272,0,74740982272
+bmin_2_ptarget_0,budget_on,run_1,/home/femu/rocksdb/experiments/M2/results/20260429-055153-budget-sensitivity/bmin_2_ptarget_0/budget_on/run_1,48,152,24,6956552727,275,16,71381463552,0,71381463552
+bmin_2_ptarget_0p5,budget_on,run_1,/home/femu/rocksdb/experiments/M2/results/20260429-055153-budget-sensitivity/bmin_2_ptarget_0p5/budget_on/run_1,59,141,39,7038023506,268,6,73662989312,0,73662989312
+bmin_6_ptarget_0,budget_on,run_1,/home/femu/rocksdb/experiments/M2/results/20260429-055153-budget-sensitivity/bmin_6_ptarget_0/budget_on/run_1,43,157,15,7163468906,270,5,72689800704,0,72689800704
+bmin_6_ptarget_0p5,budget_on,run_1,/home/femu/rocksdb/experiments/M2/results/20260429-055153-budget-sensitivity/bmin_6_ptarget_0p5/budget_on/run_1,59,141,35,6936648903,273,5,74108082176,0,74108082176
