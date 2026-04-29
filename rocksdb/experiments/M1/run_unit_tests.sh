@@ -8,6 +8,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+RESULT_PURPOSE="${RESULT_PURPOSE:-unit-tests-v1}"
 source "${SCRIPT_DIR}/common.sh"
 
 # Store the exact configuration beside the test log for reproducibility.

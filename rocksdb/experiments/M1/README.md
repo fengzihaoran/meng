@@ -106,6 +106,11 @@ CONFIRM_MKFS=1 SKIP_LIST=1 ZBD=nvme0n1 experiments/M1/run_fillrandom_sanity.sh
 - `EXTRA_DB_BENCH_ARGS=...`: 附加传给 db_bench 的参数。
 - `ZENFS_AUX_PATH=/home/femu/mnt/zenfs_aux`: ZenFS 辅助文件目录。
 - `RESULT_DIR=...`: 指定日志输出目录。
+- `RESULT_PURPOSE=...`: 没有显式设置 `RESULT_DIR` 时，结果目录使用
+  `YYYYMMDD-HHMMSS-${RESULT_PURPOSE}`，避免只有时间戳。
+
+`run_fillrandom_sanity.sh` 也会透传 `FACO_BUDGET_*` 和 `FACO_REORG_*`
+环境变量，供 M2/M3 复用同一个 db_bench runner。
 
 每次执行 fresh `mkfs` 前，脚本会检查 `${ZENFS_AUX_PATH}` 是否为空。如果不为空，会先删除其中旧内容，避免 ZenFS 报：
 
@@ -123,10 +128,10 @@ Aux directory /home/femu/mnt/zenfs_aux is not empty.
 
 ## Output
 
-每次运行会生成一个时间戳目录，例如：
+每次运行会生成一个带作用名的目录，例如：
 
 ```text
-experiments/M1/results/20260428-102509/
+experiments/M1/results/20260428-102509-fillrandom-sanity-v1/
 ```
 
 重点看这几个文件：

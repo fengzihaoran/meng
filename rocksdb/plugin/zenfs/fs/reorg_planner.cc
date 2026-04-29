@@ -53,6 +53,16 @@ size_t ReadEnvSize(const char* name, size_t default_value) {
   return parsed == 0 ? default_value : static_cast<size_t>(parsed);
 }
 
+ReorgPlanner::TauMode ReadEnvTauMode(const char* name,
+                                     ReorgPlanner::TauMode default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') return default_value;
+  const std::string mode(value);
+  if (mode == "adaptive") return ReorgPlanner::TauMode::kAdaptive;
+  if (mode == "fixed") return ReorgPlanner::TauMode::kFixed;
+  return default_value;
+}
+
 }  // namespace
 
 ReorgPlanner::Config ReorgPlanner::NormalizeConfig(Config cfg) {
@@ -74,6 +84,21 @@ ReorgPlanner::Config ReorgPlanner::NormalizeConfig(Config cfg) {
   cfg.tau_pressure_gain = std::max(0.0f, cfg.tau_pressure_gain);
   cfg.contention_penalty_bytes =
       std::max(0.0f, cfg.contention_penalty_bytes);
+  cfg.min_migrate_bytes = std::max<uint64_t>(0, cfg.min_migrate_bytes);
+  cfg.min_migrate_ratio = ClampFloat(cfg.min_migrate_ratio, 0.0f, 1.0f);
+  cfg.victim_cooldown_us = std::max<uint64_t>(0, cfg.victim_cooldown_us);
+  cfg.adaptive_history_size = std::max<size_t>(1, cfg.adaptive_history_size);
+  cfg.adaptive_q_min = ClampFloat(cfg.adaptive_q_min, 0.0f, 1.0f);
+  cfg.adaptive_q_max =
+      ClampFloat(std::max(cfg.adaptive_q_min, cfg.adaptive_q_max), 0.0f, 1.0f);
+  cfg.adaptive_q_base =
+      ClampFloat(cfg.adaptive_q_base, cfg.adaptive_q_min, cfg.adaptive_q_max);
+  cfg.adaptive_q_budget_gain =
+      ClampFloat(cfg.adaptive_q_budget_gain, 0.0f, 1.0f);
+  cfg.accept_hysteresis = std::max(0.0f, cfg.accept_hysteresis);
+  cfg.adaptive_warmup_evals =
+      std::max<uint64_t>(0, cfg.adaptive_warmup_evals);
+  cfg.min_exec_interval_us = std::max<uint64_t>(0, cfg.min_exec_interval_us);
   return cfg;
 }
 
@@ -99,6 +124,29 @@ ReorgPlanner::Config ReorgPlanner::LoadConfigFromEnv() {
       ReadEnvFloat("FACO_REORG_TAU_PRESSURE_GAIN", cfg.tau_pressure_gain);
   cfg.contention_penalty_bytes = ReadEnvFloat(
       "FACO_REORG_CONTENTION_PENALTY_BYTES", cfg.contention_penalty_bytes);
+  cfg.tau_mode = ReadEnvTauMode("FACO_REORG_TAU_MODE", cfg.tau_mode);
+  cfg.min_migrate_bytes =
+      ReadEnvUint64("FACO_REORG_MIN_MIGRATE_BYTES", cfg.min_migrate_bytes);
+  cfg.min_migrate_ratio =
+      ReadEnvFloat("FACO_REORG_MIN_MIGRATE_RATIO", cfg.min_migrate_ratio);
+  cfg.victim_cooldown_us = ReadEnvUint64(
+      "FACO_REORG_VICTIM_COOLDOWN_US", cfg.victim_cooldown_us);
+  cfg.adaptive_history_size = ReadEnvSize(
+      "FACO_REORG_ADAPTIVE_HISTORY_SIZE", cfg.adaptive_history_size);
+  cfg.adaptive_q_base =
+      ReadEnvFloat("FACO_REORG_ADAPTIVE_Q_BASE", cfg.adaptive_q_base);
+  cfg.adaptive_q_min =
+      ReadEnvFloat("FACO_REORG_ADAPTIVE_Q_MIN", cfg.adaptive_q_min);
+  cfg.adaptive_q_max =
+      ReadEnvFloat("FACO_REORG_ADAPTIVE_Q_MAX", cfg.adaptive_q_max);
+  cfg.adaptive_q_budget_gain = ReadEnvFloat(
+      "FACO_REORG_ADAPTIVE_Q_BUDGET_GAIN", cfg.adaptive_q_budget_gain);
+  cfg.accept_hysteresis =
+      ReadEnvFloat("FACO_REORG_ACCEPT_HYSTERESIS", cfg.accept_hysteresis);
+  cfg.adaptive_warmup_evals = ReadEnvUint64(
+      "FACO_REORG_ADAPTIVE_WARMUP_EVALS", cfg.adaptive_warmup_evals);
+  cfg.min_exec_interval_us = ReadEnvUint64(
+      "FACO_REORG_MIN_EXEC_INTERVAL_US", cfg.min_exec_interval_us);
   return NormalizeConfig(cfg);
 }
 
@@ -110,9 +158,23 @@ ReorgPlanner::ReorgPlanner(const Config& cfg, FragmentationStateTable* frag,
       zone_capacity_(frag != nullptr ? frag->ZoneCapacityBytes() : 0),
       tau_trigger_(cfg_.tau_trigger_init),
       foreground_p99_ema_(0.0f),
+      eval_count_(0),
+      no_candidate_count_(0),
+      rejected_plans_(0),
       accepted_plans_(0),
-      executed_plans_(0) {
+      executed_plans_(0),
+      migrated_extents_(0),
+      migrated_bytes_(0),
+      cooldown_skip_count_(0),
+      tiny_plan_skip_count_(0),
+      warmup_reject_count_(0),
+      rate_limited_reject_count_(0),
+      max_net_seen_(0.0f),
+      last_adaptive_q_(0.0f),
+      last_adaptive_tau_(0.0f),
+      last_execution_us_(0) {
   trace_.reserve(128);
+  adaptive_net_history_.reserve(cfg_.adaptive_history_size);
 }
 
 void ReorgPlanner::SetExecuteFn(ExecuteFn fn) {
@@ -122,36 +184,161 @@ void ReorgPlanner::SetExecuteFn(ExecuteFn fn) {
 
 std::optional<ReorgPlanner::Plan> ReorgPlanner::NextPlan() {
 #if FACO_ENABLE_REORG && FACO_ENABLE_CFSM
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    eval_count_++;
+  }
+
   if (frag_ == nullptr || zone_capacity_ == 0) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    no_candidate_count_++;
     return std::nullopt;
   }
 
   const std::vector<uint64_t> victims = frag_->RankVictimZones(cfg_.top_k);
   if (victims.empty()) {
-    return std::nullopt;
-  }
-
-  Plan best;
-  bool found = false;
-  for (uint64_t zone_id : victims) {
-    const float net = ComputeNet(zone_id);
-    if (!std::isfinite(net)) continue;
-    if (!found || net > best.net_benefit ||
-        (net == best.net_benefit && zone_id < best.victim_zone)) {
-      best = Plan{zone_id, net};
-      found = true;
-    }
-  }
-
-  if (!found) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    no_candidate_count_++;
     return std::nullopt;
   }
 
   const uint64_t now_us = Env::Default()->NowMicros();
+  Plan best;
+  Plan best_observed;
+  bool found = false;
+  bool observed = false;
+  uint64_t cooldown_skipped = 0;
+  uint64_t tiny_skipped = 0;
+  const uint64_t min_migrate_bytes = EffectiveMinMigrateBytes();
+  for (uint64_t zone_id : victims) {
+    const ZoneFragState state = frag_->Snapshot(zone_id);
+    const uint64_t valid = std::min(state.valid_bytes, zone_capacity_);
+    const float net = ComputeNet(zone_id);
+    if (!std::isfinite(net)) continue;
+
+    const Plan candidate{zone_id, net, valid};
+    if (!observed || net > best_observed.net_benefit ||
+        (net == best_observed.net_benefit &&
+         zone_id < best_observed.victim_zone)) {
+      best_observed = candidate;
+      observed = true;
+    }
+
+    if (min_migrate_bytes > 0 && valid < min_migrate_bytes) {
+      tiny_skipped++;
+      continue;
+    }
+
+    bool on_cooldown = false;
+    if (cfg_.victim_cooldown_us > 0) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = zone_cooldown_until_us_.find(zone_id);
+      if (it != zone_cooldown_until_us_.end()) {
+        if (now_us < it->second) {
+          on_cooldown = true;
+        } else {
+          zone_cooldown_until_us_.erase(it);
+        }
+      }
+    }
+    if (on_cooldown) {
+      cooldown_skipped++;
+      continue;
+    }
+
+    if (!found || net > best.net_benefit ||
+        (net == best.net_benefit && zone_id < best.victim_zone)) {
+      best = candidate;
+      found = true;
+    }
+  }
+
+  if (!observed) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    no_candidate_count_++;
+    return std::nullopt;
+  }
+
+  std::string reason;
+  if (!found) {
+    if (tiny_skipped > 0 && cooldown_skipped > 0) {
+      reason = "filtered_tiny_and_cooldown";
+    } else if (tiny_skipped > 0) {
+      reason = "filtered_tiny";
+    } else if (cooldown_skipped > 0) {
+      reason = "filtered_cooldown";
+    } else {
+      reason = "no_actionable_candidate";
+    }
+  }
+
+  if (!found) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    max_net_seen_ = std::max(max_net_seen_, best_observed.net_benefit);
+    tiny_plan_skip_count_ += tiny_skipped;
+    cooldown_skip_count_ += cooldown_skipped;
+    rejected_plans_++;
+    last_plan_ = best_observed;
+    const float tau_trigger = CurrentTauTriggerNoLock();
+    RecordTraceLocked(now_us, best_observed, /*accepted=*/false,
+                      cooldown_skipped, tiny_skipped, reason, tau_trigger,
+                      last_adaptive_q_, last_adaptive_tau_,
+                      /*warmup=*/false, /*rate_limited=*/false);
+    return std::nullopt;
+  }
+
   std::lock_guard<std::mutex> lock(mutex_);
-  const bool accepted = best.net_benefit > CurrentTauTriggerNoLock();
-  RecordTraceLocked(now_us, best, accepted);
+  max_net_seen_ = std::max(max_net_seen_, best_observed.net_benefit);
+  tiny_plan_skip_count_ += tiny_skipped;
+  cooldown_skip_count_ += cooldown_skipped;
+  float adaptive_q = 0.0f;
+  float adaptive_tau = 0.0f;
+  float tau_trigger = CurrentTauTriggerNoLock();
+  bool warmup = false;
+  bool rate_limited = false;
+  std::string accept_reason = "accepted";
+
+  if (cfg_.tau_mode == TauMode::kAdaptive) {
+    adaptive_q = AdaptiveQuantileNoLock();
+    const size_t history_before = adaptive_net_history_.size();
+    warmup = history_before < cfg_.adaptive_warmup_evals;
+    adaptive_tau = AdaptiveTauNoLock(adaptive_q);
+    last_adaptive_q_ = adaptive_q;
+    last_adaptive_tau_ = adaptive_tau;
+    tau_trigger = adaptive_tau * (1.0f + cfg_.accept_hysteresis);
+    if (warmup) {
+      accept_reason = "warmup";
+    }
+  }
+
+  if (!warmup && cfg_.min_exec_interval_us > 0 && last_execution_us_ > 0 &&
+      now_us < last_execution_us_ + cfg_.min_exec_interval_us) {
+    rate_limited = true;
+    accept_reason = "rate_limited";
+  }
+
+  bool accepted = best.net_benefit > tau_trigger;
+  if (warmup || rate_limited) {
+    accepted = false;
+  } else if (!accepted) {
+    accept_reason = "below_tau";
+  }
+  if (cfg_.tau_mode == TauMode::kAdaptive) {
+    RecordAdaptiveNetLocked(best.net_benefit);
+  }
+
+  RecordTraceLocked(now_us, best, accepted, cooldown_skipped, tiny_skipped,
+                    accept_reason, tau_trigger, adaptive_q, adaptive_tau,
+                    warmup, rate_limited);
   if (!accepted) {
+    rejected_plans_++;
+    if (warmup) {
+      warmup_reject_count_++;
+    }
+    if (rate_limited) {
+      rate_limited_reject_count_++;
+    }
+    last_plan_ = best;
     return std::nullopt;
   }
 
@@ -178,11 +365,27 @@ IOStatus ReorgPlanner::Execute(const Plan& p) {
   if (s.ok()) {
     std::lock_guard<std::mutex> lock(mutex_);
     executed_plans_++;
+    last_execution_us_ = Env::Default()->NowMicros();
+    if (cfg_.victim_cooldown_us > 0) {
+      zone_cooldown_until_us_[p.victim_zone] =
+          last_execution_us_ + cfg_.victim_cooldown_us;
+    }
   }
   return s;
 #else
   (void)p;
   return IOStatus::OK();
+#endif
+}
+
+void ReorgPlanner::RecordMigration(uint64_t extents, uint64_t bytes) {
+#if FACO_ENABLE_REORG && FACO_ENABLE_CFSM
+  std::lock_guard<std::mutex> lock(mutex_);
+  migrated_extents_ += extents;
+  migrated_bytes_ += bytes;
+#else
+  (void)extents;
+  (void)bytes;
 #endif
 }
 
@@ -216,14 +419,41 @@ float ReorgPlanner::CurrentTauTrigger() const {
 std::string ReorgPlanner::DebugString() const {
   std::lock_guard<std::mutex> lock(mutex_);
   std::ostringstream oss;
+  const float displayed_tau =
+      cfg_.tau_mode == TauMode::kAdaptive && last_adaptive_tau_ > 0.0f
+          ? last_adaptive_tau_ * (1.0f + cfg_.accept_hysteresis)
+          : CurrentTauTriggerNoLock();
   oss << "ReorgPlanner{tau_base=" << tau_trigger_
-      << ", tau_effective=" << CurrentTauTriggerNoLock()
+      << ", tau_effective=" << displayed_tau
+      << ", tau_mode=" << TauModeName(cfg_.tau_mode)
       << ", top_k=" << cfg_.top_k
       << ", budget=" << CurrentBudget() << "/" << MaxActiveBudget()
+      << ", min_migrate_bytes=" << EffectiveMinMigrateBytes()
+      << ", min_migrate_ratio=" << cfg_.min_migrate_ratio
+      << ", victim_cooldown_us=" << cfg_.victim_cooldown_us
+      << ", adaptive_history_size=" << adaptive_net_history_.size()
+      << "/" << cfg_.adaptive_history_size
+      << ", adaptive_q_base=" << cfg_.adaptive_q_base
+      << ", adaptive_q_last=" << last_adaptive_q_
+      << ", adaptive_tau_last=" << last_adaptive_tau_
+      << ", adaptive_warmup_evals=" << cfg_.adaptive_warmup_evals
+      << ", accept_hysteresis=" << cfg_.accept_hysteresis
+      << ", min_exec_interval_us=" << cfg_.min_exec_interval_us
+      << ", eval_count=" << eval_count_
+      << ", no_candidate_count=" << no_candidate_count_
+      << ", rejected_plans=" << rejected_plans_
       << ", accepted_plans=" << accepted_plans_
       << ", executed_plans=" << executed_plans_
+      << ", migrated_extents=" << migrated_extents_
+      << ", migrated_bytes=" << migrated_bytes_
+      << ", cooldown_skip_count=" << cooldown_skip_count_
+      << ", tiny_plan_skip_count=" << tiny_plan_skip_count_
+      << ", warmup_reject_count=" << warmup_reject_count_
+      << ", rate_limited_reject_count=" << rate_limited_reject_count_
+      << ", max_net_seen=" << max_net_seen_
       << ", last_victim=" << last_plan_.victim_zone
       << ", last_net=" << last_plan_.net_benefit
+      << ", last_valid_bytes=" << last_plan_.estimated_valid_bytes
       << ", p99_ema_us=" << foreground_p99_ema_ << "}";
   return oss.str();
 }
@@ -232,13 +462,20 @@ std::string ReorgPlanner::ExportTraceCsv() const {
   std::lock_guard<std::mutex> lock(mutex_);
   std::ostringstream oss;
   oss << "now_us,victim_zone,net_benefit,tau_trigger,accepted,"
-         "current_budget,max_active_budget\n";
+         "tau_mode,adaptive_q,adaptive_tau,warmup,rate_limited,"
+         "current_budget,max_active_budget,estimated_valid_bytes,"
+         "cooldown_skipped,tiny_skipped,history_size,reason\n";
   oss << std::setprecision(9);
   for (const TraceSample& sample : trace_) {
     oss << sample.now_us << "," << sample.victim_zone << ","
         << sample.net_benefit << "," << sample.tau_trigger << ","
-        << sample.accepted << "," << sample.current_budget << ","
-        << sample.max_active_budget << "\n";
+        << sample.accepted << "," << sample.tau_mode << ","
+        << sample.adaptive_q << "," << sample.adaptive_tau << ","
+        << sample.warmup << "," << sample.rate_limited << ","
+        << sample.current_budget << "," << sample.max_active_budget << ","
+        << sample.estimated_valid_bytes << "," << sample.cooldown_skipped
+        << "," << sample.tiny_skipped << "," << sample.history_size << ","
+        << sample.reason << "\n";
   }
   return oss.str();
 }
@@ -276,6 +513,58 @@ float ReorgPlanner::ContentionPenalty(uint64_t zone_id) const {
   return cfg_.contention_penalty_bytes * (1.0f - budget_ratio);
 }
 
+float ReorgPlanner::BudgetRatioForAdaptive() const {
+  const int max_budget = MaxActiveBudget();
+  if (max_budget <= 0) return 1.0f;
+  return ClampFloat(
+      static_cast<float>(CurrentBudget()) / static_cast<float>(max_budget),
+      0.0f, 1.0f);
+}
+
+const char* ReorgPlanner::TauModeName(TauMode mode) {
+  return mode == TauMode::kAdaptive ? "adaptive" : "fixed";
+}
+
+uint64_t ReorgPlanner::EffectiveMinMigrateBytes() const {
+  if (cfg_.min_migrate_bytes > 0 || zone_capacity_ == 0) {
+    return cfg_.min_migrate_bytes;
+  }
+  const double derived =
+      static_cast<double>(zone_capacity_) * cfg_.min_migrate_ratio;
+  if (derived <= 0.0) return 0;
+  return static_cast<uint64_t>(std::ceil(derived));
+}
+
+float ReorgPlanner::AdaptiveQuantileNoLock() const {
+  const float budget_ratio = BudgetRatioForAdaptive();
+  const float q = cfg_.adaptive_q_base -
+                  cfg_.adaptive_q_budget_gain * (1.0f - budget_ratio);
+  return ClampFloat(q, cfg_.adaptive_q_min, cfg_.adaptive_q_max);
+}
+
+float ReorgPlanner::AdaptiveTauNoLock(float q) const {
+  if (adaptive_net_history_.empty()) return CurrentTauTriggerNoLock();
+
+  std::vector<float> values = adaptive_net_history_;
+  std::sort(values.begin(), values.end());
+  if (values.size() == 1) return values[0];
+
+  const float clamped_q = ClampFloat(q, 0.0f, 1.0f);
+  const float pos = clamped_q * static_cast<float>(values.size() - 1);
+  const size_t lo = static_cast<size_t>(std::floor(pos));
+  const size_t hi = std::min(values.size() - 1, lo + 1);
+  const float frac = pos - static_cast<float>(lo);
+  return values[lo] * (1.0f - frac) + values[hi] * frac;
+}
+
+void ReorgPlanner::RecordAdaptiveNetLocked(float net_benefit) {
+  if (!std::isfinite(net_benefit)) return;
+  if (adaptive_net_history_.size() == cfg_.adaptive_history_size) {
+    adaptive_net_history_.erase(adaptive_net_history_.begin());
+  }
+  adaptive_net_history_.push_back(net_benefit);
+}
+
 float ReorgPlanner::CurrentTauTriggerNoLock() const {
   return ClampFloat(tau_trigger_ * BudgetTauScale(), cfg_.tau_min,
                     cfg_.tau_max);
@@ -304,13 +593,22 @@ int ReorgPlanner::MaxActiveBudget() const {
 }
 
 void ReorgPlanner::RecordTraceLocked(uint64_t now_us, const Plan& plan,
-                                     bool accepted) {
+                                     bool accepted,
+                                     uint64_t cooldown_skipped,
+                                     uint64_t tiny_skipped,
+                                     const std::string& reason,
+                                     float tau_trigger, float adaptive_q,
+                                     float adaptive_tau, bool warmup,
+                                     bool rate_limited) {
   if (trace_.size() == kMaxTraceSamples) {
     trace_.erase(trace_.begin());
   }
   trace_.push_back(TraceSample{
-      now_us, plan.victim_zone, plan.net_benefit, CurrentTauTriggerNoLock(),
-      accepted ? 1 : 0, CurrentBudget(), MaxActiveBudget()});
+      now_us, plan.victim_zone, plan.net_benefit, tau_trigger,
+      TauModeName(cfg_.tau_mode), adaptive_q, adaptive_tau, accepted ? 1 : 0,
+      warmup ? 1 : 0, rate_limited ? 1 : 0, CurrentBudget(),
+      MaxActiveBudget(), adaptive_net_history_.size(),
+      plan.estimated_valid_bytes, cooldown_skipped, tiny_skipped, reason});
 }
 
 }  // namespace ROCKSDB_NAMESPACE

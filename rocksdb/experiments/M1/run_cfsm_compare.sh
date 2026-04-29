@@ -9,6 +9,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+RESULT_PURPOSE="${RESULT_PURPOSE:-cfsm-compare-v1}"
 source "${SCRIPT_DIR}/common.sh"
 
 # Number of repeated runs for each variant. Increase this when collecting

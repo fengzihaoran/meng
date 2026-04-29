@@ -31,7 +31,8 @@ ZENFS_AUX_PATH="${ZENFS_AUX_PATH:-/home/femu/mnt/zenfs_aux}"
 DB_PATH="${DB_PATH:-rocksdbtest/dbbench}"
 BENCHMARKS="${BENCHMARKS:-fillrandom}"
 COMPRESSION_TYPE="${COMPRESSION_TYPE:-none}"
-RESULT_DIR="${RESULT_DIR:-${SCRIPT_DIR}/results/$(date +%Y%m%d-%H%M%S)}"
+RESULT_PURPOSE="${RESULT_PURPOSE:-m1-run-v1}"
+RESULT_DIR="${RESULT_DIR:-${SCRIPT_DIR}/results/$(date +%Y%m%d-%H%M%S)-${RESULT_PURPOSE}}"
 RESULT_OWNER="${RESULT_OWNER:-${SUDO_USER:-}}"
 
 # If the user accidentally runs the whole script through sudo, restore result

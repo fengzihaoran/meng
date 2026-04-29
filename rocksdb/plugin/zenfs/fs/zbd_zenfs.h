@@ -256,6 +256,7 @@ class ZonedBlockDevice {
     return bytes_written_.load() - gc_bytes_written_.load();
   };
   uint64_t GetTotalBytesWritten() { return bytes_written_.load(); };
+  uint64_t GetGCBytesWritten() { return gc_bytes_written_.load(); };
   std::string ExportRuntimeMetricsString() const;
 
  private:

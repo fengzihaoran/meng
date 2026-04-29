@@ -14,6 +14,22 @@ M3 replaces the legacy ZenFS invalid-ratio victim selection only when
 `FACO_ENABLE_REORG=1`. Build with `FACO_ENABLE_REORG=0` to keep the original
 GC fallback (回退路径).
 
+M3 evaluation (评估) now runs before the legacy free-space gate. The legacy GC
+path only runs when free space is low and M3 did not already attempt a plan in
+that worker cycle.
+
+The planner also applies safety gates before execution:
+
+- minimum useful migration bytes: reject top-RBD victims whose `valid_bytes`
+  are below `FACO_REORG_MIN_MIGRATE_BYTES`, or below
+  `zone_capacity * FACO_REORG_MIN_MIGRATE_RATIO` when the absolute byte knob is
+  unset;
+- victim cooldown: after a successful execution, suppress the same victim zone
+  for `FACO_REORG_VICTIM_COOLDOWN_US` so one tiny/top-ranked zone cannot
+  dominate every GC worker cycle;
+- global rate limiting: `FACO_REORG_MIN_EXEC_INTERVAL_US` prevents back-to-back
+  reorg executions even when different victim zones look attractive.
+
 ## Files
 
 - `run_reorg_tests.sh`: builds and runs `reorg_planner_test`.
@@ -83,6 +99,62 @@ Useful M3 knobs:
 - `FACO_REORG_WA_FACTOR`
 - `FACO_REORG_T_HORIZON_US`
 - `FACO_REORG_CONTENTION_PENALTY_BYTES`
+- `FACO_REORG_TAU_MODE=fixed|adaptive`
+- `FACO_REORG_MIN_MIGRATE_BYTES`
+- `FACO_REORG_MIN_MIGRATE_RATIO`
+- `FACO_REORG_VICTIM_COOLDOWN_US`
+- `FACO_REORG_ADAPTIVE_HISTORY_SIZE`
+- `FACO_REORG_ADAPTIVE_Q_BASE`
+- `FACO_REORG_ADAPTIVE_Q_MIN`
+- `FACO_REORG_ADAPTIVE_Q_MAX`
+- `FACO_REORG_ADAPTIVE_Q_BUDGET_GAIN`
+- `FACO_REORG_ACCEPT_HYSTERESIS`
+- `FACO_REORG_ADAPTIVE_WARMUP_EVALS`
+- `FACO_REORG_MIN_EXEC_INTERVAL_US`
+- `FACO_REORG_FORCE_EVAL`
+- `FACO_REORG_FREE_SPACE_TRIGGER_PERCENT`
+
+The experiment scripts default `FACO_REORG_FORCE_EVAL=1` and
+`FACO_REORG_FREE_SPACE_TRIGGER_PERCENT=100` so smoke tests exercise the M3
+decision path. They also default `FACO_REORG_TAU_MODE=adaptive`,
+`FACO_REORG_MIN_MIGRATE_RATIO=0.03125`,
+`FACO_REORG_VICTIM_COOLDOWN_US=120000000`,
+`FACO_REORG_ACCEPT_HYSTERESIS=0.01`, and
+`FACO_REORG_MIN_EXEC_INTERVAL_US=60000000` so M3 no longer depends on a
+workload-specific fixed `FACO_REORG_TAU_TRIGGER_INIT`. For a conservative
+fallback-style run, set
+`FACO_REORG_FORCE_EVAL=0 FACO_REORG_FREE_SPACE_TRIGGER_PERCENT=20`.
+
+Adaptive tau uses a rolling percentile of recent eligible `Net(z)` values:
+
+```text
+q = clamp(q_base - q_budget_gain * (1 - current_budget / max_active_budget),
+          q_min, q_max)
+adaptive_tau = percentile(recent_best_eligible_net, q)
+accept if Net(z) > adaptive_tau * (1 + accept_hysteresis)
+```
+
+Warmup samples populate the history but reject with `reason=warmup`, so the
+first few cycles do not execute against an empty distribution.
+
+Decision-path smoke test:
+
+```bash
+CONFIRM_MKFS=1 ZBD=nvme0n1 COMPARE_RUNS=1 NUM=5000000 \
+FACO_REORG_FORCE_EVAL=1 \
+bash experiments/M3/run_reorg_compare.sh
+```
+
+Forced action test:
+
+```bash
+CONFIRM_MKFS=1 ZBD=nvme0n1 COMPARE_RUNS=1 NUM=5000000 \
+FACO_REORG_FORCE_EVAL=1 \
+FACO_REORG_TAU_MIN=0 \
+FACO_REORG_TAU_TRIGGER_INIT=0 \
+FACO_REORG_CONTENTION_PENALTY_BYTES=0 \
+bash experiments/M3/run_reorg_compare.sh
+```
 
 Expected artifacts:
 
@@ -94,3 +166,40 @@ Expected artifacts:
 - `reorg_trace.svg`
 - `m3_summary.md`, `m3_run_metrics.csv`, and `m3_reorg_trace_summary.csv`
 - CFSM and budget exports reused from M1/M2 workflows
+
+The summary marks result validity (有效性). Treat `FAIL` and `PARAMETER_ONLY`
+as non-evidence for M3 performance; only `ACTIONABLE` means M3 evaluated,
+accepted, executed, and migrated bytes.
+
+## Current Verification Flow
+
+After changing the M3 trigger policy, use this order:
+
+1. Build and run unit tests:
+
+   ```bash
+   bash experiments/M3/run_reorg_tests.sh
+   ```
+
+2. Run one smoke comparison:
+
+   ```bash
+   CONFIRM_MKFS=1 ZBD=nvme0n1 COMPARE_RUNS=1 NUM=5000000 \
+   FACO_REORG_FORCE_EVAL=1 \
+   FACO_REORG_TAU_MODE=adaptive \
+   bash experiments/M3/run_reorg_compare.sh
+   ```
+
+3. Inspect `faco_reorg_trace.csv`, `faco_reorg_summary.txt`, and
+   `m3_summary.md`. A useful smoke result should have trace samples, selective
+   acceptance, nonzero real GC migration bytes, and no repeated acceptance of
+   the same victim every cycle. `migrated_bytes` is recorded from the
+   before/after `gc_bytes_written` delta, not from planned extent length.
+
+4. Only then run a larger comparison:
+
+   ```bash
+   CONFIRM_MKFS=1 ZBD=nvme0n1 COMPARE_RUNS=5 NUM=5000000 \
+   FACO_REORG_FORCE_EVAL=1 \
+   bash experiments/M3/run_reorg_compare.sh
+   ```

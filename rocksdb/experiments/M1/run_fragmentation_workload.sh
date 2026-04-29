@@ -9,6 +9,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+RESULT_PURPOSE="${RESULT_PURPOSE:-fragmentation-workload-v1}"
 source "${SCRIPT_DIR}/common.sh"
 
 # overwrite and compaction force RocksDB to create newer SSTs and obsolete older

@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import html
 import sys
+from collections import Counter
 from pathlib import Path
 
 
@@ -98,6 +99,15 @@ def write_analysis(rows: list[dict[str, str]], out_dir: Path) -> None:
     budgets = [to_float(row.get("current_budget")) for row in rows]
     nets = [to_float(row.get("net_benefit")) for row in rows]
     taus = [to_float(row.get("tau_trigger")) for row in rows]
+    reasons = Counter(row.get("reason", "") or "unknown" for row in rows)
+    cooldown_skips = sum(to_float(row.get("cooldown_skipped")) for row in rows)
+    tiny_skips = sum(to_float(row.get("tiny_skipped")) for row in rows)
+    warmup_rejects = sum(to_float(row.get("warmup")) for row in rows)
+    rate_limited_rejects = sum(to_float(row.get("rate_limited")) for row in rows)
+    adaptive_qs = [to_float(row.get("adaptive_q")) for row in rows if row.get("adaptive_q")]
+    adaptive_taus = [
+        to_float(row.get("adaptive_tau")) for row in rows if row.get("adaptive_tau")
+    ]
 
     analysis = out_dir / "reorg_trace_analysis.md"
     lines = [
@@ -109,6 +119,13 @@ def write_analysis(rows: list[dict[str, str]], out_dir: Path) -> None:
         f"- last tau trigger: `{taus[-1] if taus else 0:.3f}`",
         f"- min current budget: `{min(budgets) if budgets else 0:.0f}`",
         f"- max current budget: `{max(budgets) if budgets else 0:.0f}`",
+        f"- cooldown skips: `{cooldown_skips:.0f}`",
+        f"- tiny skips: `{tiny_skips:.0f}`",
+        f"- warmup rejects: `{warmup_rejects:.0f}`",
+        f"- rate-limited rejects: `{rate_limited_rejects:.0f}`",
+        f"- avg adaptive q: `{(sum(adaptive_qs) / len(adaptive_qs)) if adaptive_qs else 0:.3f}`",
+        f"- last adaptive tau: `{adaptive_taus[-1] if adaptive_taus else 0:.3f}`",
+        f"- decision reasons: `{dict(reasons)}`",
         "",
         "M3 uses RBD-ranked top victim zones as the primary candidate source. "
         "ZVDR remains only the optional trend term inside Net(z).",

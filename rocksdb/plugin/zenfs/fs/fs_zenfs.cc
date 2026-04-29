@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -34,6 +35,42 @@
 #define DEFAULT_ZENV_LOG_PATH "/tmp/"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+#if FACO_ENABLE_REORG && FACO_ENABLE_CFSM
+
+bool EndsWith(const std::string& s, const std::string& suffix) {
+  return s.size() >= suffix.size() &&
+         s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+#endif  // FACO_ENABLE_REORG && FACO_ENABLE_CFSM
+
+bool ReadFacoEnvBool(const char* name, bool default_value) {
+  const char* value = getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return default_value;
+  }
+  return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 ||
+         strcmp(value, "TRUE") == 0 || strcmp(value, "yes") == 0 ||
+         strcmp(value, "on") == 0;
+}
+
+uint64_t ReadFacoEnvPercent(const char* name, uint64_t default_value) {
+  const char* value = getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return default_value;
+  }
+  char* end = nullptr;
+  const unsigned long long parsed = strtoull(value, &end, 10);
+  if (end == value) {
+    return default_value;
+  }
+  return std::min<uint64_t>(100, static_cast<uint64_t>(parsed));
+}
+
+}  // namespace
 
 Status Superblock::DecodeFrom(Slice* input) {
   if (input->size() != ENCODED_SIZE) {
@@ -421,26 +458,49 @@ IOStatus ZenFS::ExecuteReorgPlan(const ReorgPlanner::Plan& plan) {
 
   const uint64_t zone_start = plan.victim_zone * zbd_->GetZoneSize();
   std::vector<ZoneExtentSnapshot*> migrate_exts;
+  uint64_t skipped_non_sst_extents = 0;
   for (auto& ext : snapshot.extents_) {
     if (ext.zone_start == zone_start) {
-      migrate_exts.push_back(&ext);
+      if (EndsWith(ext.filename, ".sst")) {
+        migrate_exts.push_back(&ext);
+      } else {
+        skipped_non_sst_extents++;
+      }
     }
   }
 
   if (migrate_exts.empty()) {
     Info(logger_,
-         "FACO reorg: victim zone %lu has no live extents to migrate",
-         plan.victim_zone);
+         "FACO reorg: victim zone %lu has no SST extents to migrate "
+         "(estimated valid bytes %lu, skipped non-SST extents %lu)",
+         plan.victim_zone, plan.estimated_valid_bytes,
+         skipped_non_sst_extents);
     return IOStatus::OK();
   }
 
+  uint64_t migrate_bytes = 0;
+  for (const auto* ext : migrate_exts) {
+    migrate_bytes += ext->length;
+  }
+
   Info(logger_,
-       "FACO reorg: migrating %d extents from zone %lu, net benefit %.2f",
-       static_cast<int>(migrate_exts.size()), plan.victim_zone,
-       plan.net_benefit);
+       "FACO reorg: migrating %d SST extents (%lu bytes) from zone %lu, "
+       "estimated valid bytes %lu, skipped non-SST extents %lu, net benefit %.2f",
+       static_cast<int>(migrate_exts.size()), migrate_bytes,
+       plan.victim_zone, plan.estimated_valid_bytes,
+       skipped_non_sst_extents, plan.net_benefit);
+  const uint64_t gc_bytes_before = zbd_->GetGCBytesWritten();
   IOStatus s = MigrateExtents(migrate_exts);
   if (!s.ok()) {
     return s;
+  }
+  const uint64_t gc_bytes_after = zbd_->GetGCBytesWritten();
+  const uint64_t gc_bytes_delta =
+      gc_bytes_after >= gc_bytes_before ? gc_bytes_after - gc_bytes_before : 0;
+  Info(logger_, "FACO reorg: migration completed for zone %lu, actual GC bytes %lu",
+       plan.victim_zone, gc_bytes_delta);
+  if (reorg_planner_ != nullptr) {
+    reorg_planner_->RecordMigration(migrate_exts.size(), gc_bytes_delta);
   }
 
   // MigrateExtents resets after each migrated SST file.  Run one final pass so
@@ -469,20 +529,34 @@ void ZenFS::GCWorker() {
     ZenFSSnapshot snapshot;
     ZenFSSnapshotOptions options;
 
-    if (free_percent > GC_START_LEVEL) continue;
+    const uint64_t legacy_gc_start_level = GC_START_LEVEL;
+    const uint64_t reorg_free_trigger_percent = ReadFacoEnvPercent(
+        "FACO_REORG_FREE_SPACE_TRIGGER_PERCENT", /*default_value=*/100);
+    const bool force_reorg_eval =
+        ReadFacoEnvBool("FACO_REORG_FORCE_EVAL", /*default_value=*/false);
+    const bool legacy_low_free = free_percent <= legacy_gc_start_level;
+    const bool should_eval_reorg =
+        force_reorg_eval || free_percent <= reorg_free_trigger_percent;
+    bool m3_plan_attempted = false;
 
 #if FACO_ENABLE_REORG && FACO_ENABLE_CFSM
-    if (reorg_planner_ != nullptr) {
+    if (reorg_planner_ != nullptr && should_eval_reorg) {
       std::optional<ReorgPlanner::Plan> plan = reorg_planner_->NextPlan();
       if (plan.has_value()) {
+        m3_plan_attempted = true;
         IOStatus s = reorg_planner_->Execute(*plan);
         if (!s.ok()) {
           Error(logger_, "FACO reorg failed: %s", s.ToString().c_str());
         }
       }
-      continue;
     }
 #endif
+
+    // M3 is evaluated proactively.  Legacy ZenFS GC remains the fallback only
+    // when free space is low and M3 did not already attempt a plan this cycle.
+    if (!legacy_low_free || m3_plan_attempted) {
+      continue;
+    }
 
     options.zone_ = 1;
     options.zone_file_ = 1;
@@ -490,7 +564,8 @@ void ZenFS::GCWorker() {
 
     GetZenFSSnapshot(snapshot, options);
 
-    uint64_t threshold = (100 - GC_SLOPE * (GC_START_LEVEL - free_percent));
+    uint64_t threshold =
+        (100 - GC_SLOPE * (legacy_gc_start_level - free_percent));
     std::set<uint64_t> migrate_zones_start;
     for (const auto& zone : snapshot.zones_) {
       if (zone.capacity == 0) {
