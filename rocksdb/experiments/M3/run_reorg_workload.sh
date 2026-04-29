@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Purpose:
+#   Run one FACO M3 workload with CFSM, M2 budget control, and M3 reorg enabled.
+#   The script reuses the M1 db_bench runner so mkfs, CFSM export, and ZenFS
+#   listing behavior stay consistent across modules.
+#
+# Typical usage:
+#   CONFIRM_MKFS=1 ZBD=nvme0n1 bash experiments/M3/run_reorg_workload.sh
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+M3_SCRIPT_DIR="${SCRIPT_DIR}"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+RESULT_DIR="${RESULT_DIR:-${M3_SCRIPT_DIR}/results/$(date +%Y%m%d-%H%M%S)-reorg-workload-v1}"
+source "${REPO_ROOT}/experiments/M1/common.sh"
+SCRIPT_DIR="${M3_SCRIPT_DIR}"
+
+mkdir -p "${RESULT_DIR}"
+
+cat <<EOF | tee "${RESULT_DIR}/reorg_workload_config.txt"
+M3 reorg workload:
+  REPO_ROOT=${REPO_ROOT}
+  RESULT_DIR=${RESULT_DIR}
+  ZBD=${ZBD}
+  ZENFS_AUX_PATH=${ZENFS_AUX_PATH}
+  BENCHMARKS=${M3_BENCHMARKS:-fillrandom,overwrite,overwrite,stats}
+  NUM=${NUM:-5000000}
+  VALUE_SIZE=${VALUE_SIZE:-1024}
+  ZENFS_ENABLE_GC=1
+  FACO_BUDGET_B_MIN=${FACO_BUDGET_B_MIN:-6}
+  FACO_BUDGET_P_TARGET=${FACO_BUDGET_P_TARGET:-0}
+  FACO_BUDGET_ZVDR_WEIGHT=${FACO_BUDGET_ZVDR_WEIGHT:-0}
+  FACO_REORG_TOP_K=${FACO_REORG_TOP_K:-8}
+  FACO_REORG_TAU_TRIGGER_INIT=${FACO_REORG_TAU_TRIGGER_INIT:-5242880}
+EOF
+
+BUILD_RELEASE_DIR="${BUILD_RELEASE_DIR}" \
+DB_BENCH="${DB_BENCH}" \
+ZENFS_TOOL="${ZENFS_TOOL}" \
+RESULT_DIR="${RESULT_DIR}" \
+CONFIRM_MKFS="${CONFIRM_MKFS:-0}" \
+ZBD="${ZBD}" \
+ZENFS_AUX_PATH="${ZENFS_AUX_PATH}" \
+DB_PATH="${DB_PATH}" \
+BENCHMARKS="${M3_BENCHMARKS:-fillrandom,overwrite,overwrite,stats}" \
+NUM="${NUM:-5000000}" \
+VALUE_SIZE="${VALUE_SIZE:-1024}" \
+COMPRESSION_TYPE="${COMPRESSION_TYPE}" \
+ZENFS_ENABLE_GC=1 \
+EXTRA_DB_BENCH_ARGS="${EXTRA_DB_BENCH_ARGS:-}" \
+FACO_BUDGET_B_MIN="${FACO_BUDGET_B_MIN:-6}" \
+FACO_BUDGET_B_MAX="${FACO_BUDGET_B_MAX:-12}" \
+FACO_BUDGET_KP="${FACO_BUDGET_KP:-0.6}" \
+FACO_BUDGET_KI="${FACO_BUDGET_KI:-0.05}" \
+FACO_BUDGET_P_TARGET="${FACO_BUDGET_P_TARGET:-0}" \
+FACO_BUDGET_TOP_K="${FACO_BUDGET_TOP_K:-8}" \
+FACO_BUDGET_RBD_THRESHOLD="${FACO_BUDGET_RBD_THRESHOLD:-0.05}" \
+FACO_BUDGET_ZVDR_WEIGHT="${FACO_BUDGET_ZVDR_WEIGHT:-0}" \
+FACO_REORG_TOP_K="${FACO_REORG_TOP_K:-8}" \
+FACO_REORG_TAU_TRIGGER_INIT="${FACO_REORG_TAU_TRIGGER_INIT:-5242880}" \
+FACO_REORG_CONTENTION_PENALTY_BYTES="${FACO_REORG_CONTENTION_PENALTY_BYTES:-4194304}" \
+  bash "${REPO_ROOT}/experiments/M1/run_fillrandom_sanity.sh"
+
+{
+  for export_file in \
+    faco_budget_summary.txt \
+    faco_budget_trace.csv \
+    faco_reorg_summary.txt \
+    faco_reorg_trace.csv \
+    faco_runtime_metrics.txt; do
+    src="${ZENFS_AUX_PATH}/${export_file}"
+    dst="${RESULT_DIR}/${export_file}"
+    if run_sudo test -f "${src}"; then
+      run_sudo cat "${src}" > "${dst}"
+      echo "Copied ${src} to ${dst}"
+    else
+      echo "FACO export not found: ${src}"
+    fi
+  done
+} | tee "${RESULT_DIR}/faco_reorg_export.log"
+
+if [[ -f "${RESULT_DIR}/faco_reorg_trace.csv" ]]; then
+  python3 "${SCRIPT_DIR}/analyze_reorg_trace.py" \
+    "${RESULT_DIR}/faco_reorg_trace.csv" "${RESULT_DIR}"
+fi
+
+echo "M3 reorg workload completed. Inspect:"
+echo "  ${RESULT_DIR}/faco_reorg_summary.txt"
+echo "  ${RESULT_DIR}/faco_reorg_trace.csv"
+echo "  ${RESULT_DIR}/reorg_trace_analysis.md"

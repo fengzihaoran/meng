@@ -318,6 +318,8 @@ void ZenFS::DumpFragmentationState() {
   const std::string budget_summary_path =
       aux_path + "/faco_budget_summary.txt";
   const std::string budget_trace_path = aux_path + "/faco_budget_trace.csv";
+  const std::string reorg_summary_path = aux_path + "/faco_reorg_summary.txt";
+  const std::string reorg_trace_path = aux_path + "/faco_reorg_trace.csv";
   const std::string runtime_metrics_path =
       aux_path + "/faco_runtime_metrics.txt";
 
@@ -359,6 +361,25 @@ void ZenFS::DumpFragmentationState() {
     }
   }
 
+  if (reorg_planner_ != nullptr) {
+    std::ofstream reorg_summary_file(reorg_summary_path);
+    if (reorg_summary_file.good()) {
+      reorg_summary_file << reorg_planner_->DebugString() << "\n";
+    } else {
+      Warn(logger_, "FACO reorg: failed to write summary to %s",
+           reorg_summary_path.c_str());
+    }
+
+    const std::string reorg_trace = reorg_planner_->ExportTraceCsv();
+    std::ofstream reorg_trace_file(reorg_trace_path);
+    if (reorg_trace_file.good()) {
+      reorg_trace_file << reorg_trace;
+    } else {
+      Warn(logger_, "FACO reorg: failed to write trace to %s",
+           reorg_trace_path.c_str());
+    }
+  }
+
   std::ofstream runtime_metrics(runtime_metrics_path);
   if (runtime_metrics.good()) {
     runtime_metrics << zbd_->ExportRuntimeMetricsString();
@@ -366,6 +387,70 @@ void ZenFS::DumpFragmentationState() {
     Warn(logger_, "FACO runtime: failed to write metrics to %s",
          runtime_metrics_path.c_str());
   }
+}
+
+void ZenFS::EnableReorgPlanner() {
+#if FACO_ENABLE_REORG && FACO_ENABLE_CFSM
+  if (reorg_planner_ != nullptr) {
+    return;
+  }
+
+  auto frag_table = zbd_->GetFragmentationStateTable();
+  if (frag_table == nullptr) {
+    return;
+  }
+
+  ReorgPlanner::Config cfg = ReorgPlanner::LoadConfigFromEnv();
+  reorg_planner_.reset(new ReorgPlanner(cfg, frag_table.get(), zbd_));
+  reorg_planner_->SetExecuteFn(
+      [this](const ReorgPlanner::Plan& plan) -> IOStatus {
+        return ExecuteReorgPlan(plan);
+      });
+  Info(logger_, "FACO reorg planner enabled: %s",
+       reorg_planner_->DebugString().c_str());
+#endif
+}
+
+IOStatus ZenFS::ExecuteReorgPlan(const ReorgPlanner::Plan& plan) {
+#if FACO_ENABLE_REORG && FACO_ENABLE_CFSM
+  ZenFSSnapshot snapshot;
+  ZenFSSnapshotOptions options;
+  options.zone_file_ = 1;
+  options.log_garbage_ = 1;
+  GetZenFSSnapshot(snapshot, options);
+
+  const uint64_t zone_start = plan.victim_zone * zbd_->GetZoneSize();
+  std::vector<ZoneExtentSnapshot*> migrate_exts;
+  for (auto& ext : snapshot.extents_) {
+    if (ext.zone_start == zone_start) {
+      migrate_exts.push_back(&ext);
+    }
+  }
+
+  if (migrate_exts.empty()) {
+    Info(logger_,
+         "FACO reorg: victim zone %lu has no live extents to migrate",
+         plan.victim_zone);
+    return IOStatus::OK();
+  }
+
+  Info(logger_,
+       "FACO reorg: migrating %d extents from zone %lu, net benefit %.2f",
+       static_cast<int>(migrate_exts.size()), plan.victim_zone,
+       plan.net_benefit);
+  IOStatus s = MigrateExtents(migrate_exts);
+  if (!s.ok()) {
+    return s;
+  }
+
+  // MigrateExtents resets after each migrated SST file.  Run one final pass so
+  // a zone whose last valid extent just moved is reclaimed before the next GC
+  // interval.
+  return zbd_->ResetUnusedIOZones();
+#else
+  (void)plan;
+  return IOStatus::OK();
+#endif
 }
 
 void ZenFS::GCWorker() {
@@ -385,6 +470,19 @@ void ZenFS::GCWorker() {
     ZenFSSnapshotOptions options;
 
     if (free_percent > GC_START_LEVEL) continue;
+
+#if FACO_ENABLE_REORG && FACO_ENABLE_CFSM
+    if (reorg_planner_ != nullptr) {
+      std::optional<ReorgPlanner::Plan> plan = reorg_planner_->NextPlan();
+      if (plan.has_value()) {
+        IOStatus s = reorg_planner_->Execute(*plan);
+        if (!s.ok()) {
+          Error(logger_, "FACO reorg failed: %s", s.ToString().c_str());
+        }
+      }
+      continue;
+    }
+#endif
 
     options.zone_ = 1;
     options.zone_file_ = 1;
@@ -1733,6 +1831,7 @@ Status NewZenFS(FileSystem** fs, const ZbdBackendType backend_type,
     return s;
   }
   zbd->EnableZoneBudget();
+  zenFS->EnableReorgPlanner();
 
   *fs = zenFS;
   return Status::OK();

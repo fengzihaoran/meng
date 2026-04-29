@@ -117,6 +117,9 @@ class FragmentationStateTable {
   /** Summarizes global CFSM counters and top victim candidates. */
   std::string SummaryString(size_t top_k = 10) const;
 
+  /** Returns the immutable per-zone capacity used by CFSM calculations. */
+  uint64_t ZoneCapacityBytes() const { return zone_capacity_bytes_; }
+
  private:
   bool IsValidZone(uint64_t zone_id) const;
   void UpdateFragmentClass(ZoneFragState* state) const;

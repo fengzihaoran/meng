@@ -223,6 +223,10 @@ class ZonedBlockDevice {
   std::shared_ptr<FragmentationStateTable> GetFragmentationStateTable();
   void EnableZoneBudget();
   void UpdateZoneBudget(uint64_t now_us);
+  int GetCurrentZoneBudget() const;
+  unsigned int GetMaxActiveIOZoneLimit() const {
+    return max_nr_active_io_zones_;
+  }
   std::string GetZoneBudgetDebugString();
   std::string ExportZoneBudgetTraceCsv();
 

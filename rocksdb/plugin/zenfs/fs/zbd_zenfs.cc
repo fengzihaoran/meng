@@ -417,6 +417,15 @@ void ZonedBlockDevice::UpdateZoneBudget(uint64_t now_us) {
 #endif
 }
 
+int ZonedBlockDevice::GetCurrentZoneBudget() const {
+#if FACO_ENABLE_BUDGET && FACO_ENABLE_CFSM
+  if (budget_ctrl_ != nullptr) {
+    return budget_ctrl_->GetCurrentAllocBudget();
+  }
+#endif
+  return static_cast<int>(max_nr_active_io_zones_);
+}
+
 std::string ZonedBlockDevice::GetZoneBudgetDebugString() {
 #if FACO_ENABLE_BUDGET && FACO_ENABLE_CFSM
   if (budget_ctrl_ != nullptr) {

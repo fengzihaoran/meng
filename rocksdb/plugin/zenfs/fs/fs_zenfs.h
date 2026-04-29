@@ -19,6 +19,7 @@ namespace fs = std::filesystem;
 
 #include "io_zenfs.h"
 #include "metrics.h"
+#include "reorg_planner.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/status.h"
@@ -148,6 +149,7 @@ class ZenFS : public FileSystemWrapper {
 
   std::unique_ptr<std::thread> gc_worker_ = nullptr;
   bool run_gc_worker_ = false;
+  std::unique_ptr<ReorgPlanner> reorg_planner_ = nullptr;
 
   struct ZenFSMetadataWriter : public MetadataWriter {
     ZenFS* zenFS;
@@ -206,6 +208,7 @@ class ZenFS : public FileSystemWrapper {
   }
 
   void DumpFragmentationState();
+  IOStatus ExecuteReorgPlan(const ReorgPlanner::Plan& plan);
 
   std::string ToZenFSPath(std::string aux_path) {
     std::string path = aux_path;
@@ -283,6 +286,7 @@ class ZenFS : public FileSystemWrapper {
   Status Mount(bool readonly);
   Status MkFS(std::string aux_fs_path, uint32_t finish_threshold,
               bool enable_gc);
+  void EnableReorgPlanner();
   std::map<std::string, Env::WriteLifeTimeHint> GetWriteLifeTimeHints();
 
   const char* Name() const override {
