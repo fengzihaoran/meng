@@ -224,6 +224,7 @@ class ZonedBlockDevice {
   void EnableZoneBudget();
   void UpdateZoneBudget(uint64_t now_us);
   int GetCurrentZoneBudget() const;
+  int GetMaxZoneBudget() const;
   unsigned int GetMaxActiveIOZoneLimit() const {
     return max_nr_active_io_zones_;
   }

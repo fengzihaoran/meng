@@ -58,6 +58,9 @@ class ZoneBudgetCtrl {
   /** Returns the current active-zone allocation budget for AllocateIOZone. */
   int GetCurrentAllocBudget() const;
 
+  /** Returns the normalized upper bound of M2's allocation budget. */
+  int GetMaxAllocBudget() const;
+
   /** Recomputes fragmentation pressure and adjusts the PI budget. */
   void Update(uint64_t now_us);
 

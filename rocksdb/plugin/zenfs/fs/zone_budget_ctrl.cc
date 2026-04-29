@@ -82,6 +82,8 @@ int ZoneBudgetCtrl::GetCurrentAllocBudget() const {
 #endif
 }
 
+int ZoneBudgetCtrl::GetMaxAllocBudget() const { return cfg_.B_max; }
+
 void ZoneBudgetCtrl::Update(uint64_t now_us) {
 #if FACO_ENABLE_BUDGET
   {

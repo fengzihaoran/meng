@@ -23,9 +23,10 @@ if [[ "${SKIP_CONFIGURE:-0}" != "1" ]]; then
     -DCMAKE_CXX_FLAGS="-DFACO_ENABLE_CFSM=1 -DFACO_ENABLE_BUDGET=1 -DFACO_ENABLE_REORG=1 ${EXTRA_CMAKE_CXX_FLAGS:-}"
 fi
 
-cmake --build "${BUILD_DEBUG_DIR}" --target reorg_planner_test -j"$(nproc)"
+cmake --build "${BUILD_DEBUG_DIR}" --target zone_budget_ctrl_test \
+  reorg_planner_test -j"$(nproc)"
 
-for test_name in reorg_planner_test; do
+for test_name in zone_budget_ctrl_test reorg_planner_test; do
   echo "Running ${test_name}"
   "${BUILD_DEBUG_DIR}/${test_name}" 2>&1 | tee "${RESULT_DIR}/${test_name}.log"
 done

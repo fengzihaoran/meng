@@ -589,6 +589,8 @@ int ReorgPlanner::CurrentBudget() const {
 
 int ReorgPlanner::MaxActiveBudget() const {
   if (zbd_ == nullptr) return 0;
+  const int budget_max = zbd_->GetMaxZoneBudget();
+  if (budget_max > 0) return budget_max;
   return static_cast<int>(zbd_->GetMaxActiveIOZoneLimit());
 }
 

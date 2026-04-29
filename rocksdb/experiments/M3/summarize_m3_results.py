@@ -85,6 +85,31 @@ def collect_runtime_rows(root: Path) -> list[dict[str, str]]:
     return rows
 
 
+def collect_zone_state_rows(root: Path) -> list[dict[str, str]]:
+    """Collect CFSM zone-state counters exported by each workload run."""
+    rows: list[dict[str, str]] = []
+    for summary_path in sorted(root.rglob("faco_cfsm_summary.txt")):
+        run_dir = summary_path.parent
+        variant, run_name = scenario_from_run_dir(run_dir)
+        summary = parse_kv(summary_path)
+        cold_high = to_float(summary.get("class_cold_high"))
+        hot_high = to_float(summary.get("class_hot_high"))
+        rows.append(
+            {
+                "variant": variant,
+                "run": run_name,
+                "active_zones": summary.get("active_zones", ""),
+                "empty_zones": summary.get("empty_zones", ""),
+                "high_frag_zones": f"{cold_high + hot_high:.0f}",
+                "class_cold_high": summary.get("class_cold_high", ""),
+                "class_hot_high": summary.get("class_hot_high", ""),
+                "total_valid_bytes": summary.get("total_valid_bytes", ""),
+                "result_dir": str(run_dir),
+            }
+        )
+    return rows
+
+
 def collect_reorg_rows(root: Path) -> list[dict[str, str]]:
     """Collect one summary row per M3 reorg trace."""
     rows: list[dict[str, str]] = []
@@ -194,10 +219,17 @@ def validity_status(runtime_rows: list[dict[str, str]], reorg_rows: list[dict[st
     return "ACTIONABLE: M3 evaluated and migrated data"
 
 
-def write_markdown(root: Path, out_md: Path, runtime_rows: list[dict[str, str]], reorg_rows: list[dict[str, str]]) -> None:
+def write_markdown(
+    root: Path,
+    out_md: Path,
+    runtime_rows: list[dict[str, str]],
+    reorg_rows: list[dict[str, str]],
+    zone_rows: list[dict[str, str]],
+) -> None:
     """Write the M3 rollup report."""
     runtime_by_variant = group_by_variant(runtime_rows)
     reorg_by_variant = group_by_variant(reorg_rows)
+    zone_by_variant = group_by_variant(zone_rows)
     validity = validity_status(runtime_rows, reorg_rows)
     lines = [
         "# M3 reorg summary",
@@ -221,6 +253,28 @@ def write_markdown(root: Path, out_md: Path, runtime_rows: list[dict[str, str]],
                 mean([to_float(r.get("zone_finish_count")) for r in group]),
                 mean([to_float(r.get("write_amplification")) for r in group]),
                 mean([to_float(r.get("gc_bytes_written")) for r in group])
+                / (1024 ** 3),
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Zone State",
+            "",
+            "| variant | runs | avg active zones | avg empty zones | avg high-frag zones | avg valid GB |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for variant, group in sorted(zone_by_variant.items()):
+        lines.append(
+            "| {} | {} | {:.2f} | {:.2f} | {:.2f} | {:.3f} |".format(
+                variant,
+                len(group),
+                mean([to_float(r.get("active_zones")) for r in group]),
+                mean([to_float(r.get("empty_zones")) for r in group]),
+                mean([to_float(r.get("high_frag_zones")) for r in group]),
+                mean([to_float(r.get("total_valid_bytes")) for r in group])
                 / (1024 ** 3),
             )
         )
@@ -281,9 +335,11 @@ def main() -> int:
     out_md = Path(sys.argv[2])
     runtime_rows = collect_runtime_rows(root)
     reorg_rows = collect_reorg_rows(root)
+    zone_rows = collect_zone_state_rows(root)
     write_csv(out_md.with_name("m3_run_metrics.csv"), runtime_rows)
     write_csv(out_md.with_name("m3_reorg_trace_summary.csv"), reorg_rows)
-    write_markdown(root, out_md, runtime_rows, reorg_rows)
+    write_csv(out_md.with_name("m3_zone_state.csv"), zone_rows)
+    write_markdown(root, out_md, runtime_rows, reorg_rows, zone_rows)
     print(f"Wrote {out_md}")
     return 0
 
