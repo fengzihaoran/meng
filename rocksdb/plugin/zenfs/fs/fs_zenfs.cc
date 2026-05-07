@@ -26,6 +26,7 @@
 #ifdef ZENFS_EXPORT_PROMETHEUS
 #include "metrics_prometheus.h"
 #endif
+#include "db/faco_lacr_state.h"
 #include "frag_state_table.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "snapshot.h"
@@ -46,6 +47,16 @@ bool EndsWith(const std::string& s, const std::string& suffix) {
 }
 
 #endif  // FACO_ENABLE_REORG && FACO_ENABLE_CFSM
+
+#if FACO_ENABLE_LACR
+std::string FacoLacrBaseName(const std::string& file) {
+  const size_t slash = file.find_last_of("/\\");
+  if (slash == std::string::npos) {
+    return file;
+  }
+  return file.substr(slash + 1);
+}
+#endif  // FACO_ENABLE_LACR
 
 bool ReadFacoEnvBool(const char* name, bool default_value) {
   const char* value = getenv(name);
@@ -291,28 +302,47 @@ ZenFS::ZenFS(ZonedBlockDevice* zbd, std::shared_ptr<FileSystem> aux_fs,
   next_file_id_ = 1;
   metadata_writer_.zenFS = this;
 
+  auto file_zone_map_fn =
+      [this](const std::string& filename)
+          -> std::vector<std::pair<uint64_t, uint64_t>> {
+    std::vector<std::pair<uint64_t, uint64_t>> zones;
+    std::lock_guard<std::mutex> lock(files_mtx_);
+    std::shared_ptr<ZoneFile> zfile =
+        GetFileNoLock(FormatPathLexically(filename));
+#if FACO_ENABLE_LACR
+    if (zfile == nullptr) {
+      const std::string base_name = FacoLacrBaseName(filename);
+      zfile = GetFileNoLock(FormatPathLexically(base_name));
+      if (zfile == nullptr) {
+        for (const auto& file_it : files_) {
+          if (FacoLacrBaseName(file_it.first) == base_name) {
+            zfile = file_it.second;
+            break;
+          }
+        }
+      }
+    }
+#endif  // FACO_ENABLE_LACR
+    if (zfile == nullptr) return zones;
+
+    for (ZoneExtent* extent : zfile->GetExtents()) {
+      if (extent->zone_ != nullptr) {
+        zones.emplace_back(extent->zone_->GetZoneNr(), extent->length_);
+      }
+    }
+    return zones;
+  };
+
   auto frag_table = zbd_->GetFragmentationStateTable();
   if (frag_table != nullptr) {
     // FFD needs the live file->zone extent view.  The callback stays in ZenFS
     // so CFSM does not own or duplicate file metadata.
-    frag_table->SetFileZoneMapFn(
-        [this](const std::string& filename)
-            -> std::vector<std::pair<uint64_t, uint64_t>> {
-          std::vector<std::pair<uint64_t, uint64_t>> zones;
-          std::lock_guard<std::mutex> lock(files_mtx_);
-          std::shared_ptr<ZoneFile> zfile =
-              GetFileNoLock(FormatPathLexically(filename));
-          if (zfile == nullptr) return zones;
-
-          for (ZoneExtent* extent : zfile->GetExtents()) {
-            if (extent->zone_ != nullptr) {
-              zones.emplace_back(extent->zone_->GetZoneNr(),
-                                 extent->length_);
-            }
-          }
-          return zones;
-        });
+    frag_table->SetFileZoneMapFn(file_zone_map_fn);
   }
+
+#if FACO_ENABLE_LACR
+  GetFacoLacrState().SetFileZoneMapFn(file_zone_map_fn);
+#endif  // FACO_ENABLE_LACR
 }
 
 ZenFS::~ZenFS() {
@@ -332,6 +362,9 @@ ZenFS::~ZenFS() {
   if (frag_table != nullptr) {
     frag_table->SetFileZoneMapFn(nullptr);
   }
+#if FACO_ENABLE_LACR
+  GetFacoLacrState().SetFileZoneMapFn(nullptr);
+#endif  // FACO_ENABLE_LACR
 
   meta_log_.reset(nullptr);
   ClearFiles();
@@ -357,6 +390,7 @@ void ZenFS::DumpFragmentationState() {
   const std::string budget_trace_path = aux_path + "/faco_budget_trace.csv";
   const std::string reorg_summary_path = aux_path + "/faco_reorg_summary.txt";
   const std::string reorg_trace_path = aux_path + "/faco_reorg_trace.csv";
+  const std::string lacr_trace_path = aux_path + "/faco_lacr_trace.csv";
   const std::string runtime_metrics_path =
       aux_path + "/faco_runtime_metrics.txt";
 
@@ -416,6 +450,18 @@ void ZenFS::DumpFragmentationState() {
            reorg_trace_path.c_str());
     }
   }
+
+#if FACO_ENABLE_LACR
+  if (FacoLacrRuntimeEnabled()) {
+    std::ofstream lacr_trace_file(lacr_trace_path);
+    if (lacr_trace_file.good()) {
+      lacr_trace_file << GetFacoLacrState().ExportTraceCsv();
+    } else {
+      Warn(logger_, "FACO LACR: failed to write trace to %s",
+           lacr_trace_path.c_str());
+    }
+  }
+#endif  // FACO_ENABLE_LACR
 
   std::ofstream runtime_metrics(runtime_metrics_path);
   if (runtime_metrics.good()) {

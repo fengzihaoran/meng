@@ -81,6 +81,7 @@ copy_faco_exports() {
       faco_budget_trace.csv \
       faco_reorg_summary.txt \
       faco_reorg_trace.csv \
+      faco_lacr_trace.csv \
       faco_runtime_metrics.txt; do
       local src="${ZENFS_AUX_PATH}/${export_file}"
       local dst="${run_dir}/${export_file}"
@@ -151,6 +152,12 @@ run_variant() {
     FACO_REORG_MIN_EXEC_INTERVAL_US="${FACO_REORG_MIN_EXEC_INTERVAL_US:-60000000}" \
     FACO_REORG_FORCE_EVAL="${FACO_REORG_FORCE_EVAL:-1}" \
     FACO_REORG_FREE_SPACE_TRIGGER_PERCENT="${FACO_REORG_FREE_SPACE_TRIGGER_PERCENT:-100}" \
+    FACO_LACR_ENABLE="${FACO_LACR_ENABLE:-0}" \
+    FACO_LACR_W_SYNERGY="${FACO_LACR_W_SYNERGY:-0}" \
+    FACO_LACR_W_WASTE="${FACO_LACR_W_WASTE:-1}" \
+    FACO_LACR_W_LATENCY="${FACO_LACR_W_LATENCY:-0.25}" \
+    FACO_LACR_ACTIVE_COMPACTION_PENALTY_BYTES="${FACO_LACR_ACTIVE_COMPACTION_PENALTY_BYTES:-8388608}" \
+    FACO_LACR_RECENT_INVALIDATION_BONUS_BYTES="${FACO_LACR_RECENT_INVALIDATION_BONUS_BYTES:-4194304}" \
       bash "${REPO_ROOT}/experiments/M1/run_fillrandom_sanity.sh"
 
     copy_faco_exports "${run_dir}"
@@ -197,6 +204,7 @@ cat <<EOF | tee -a "${RESULT_DIR}/compare_config.txt"
   FACO_REORG_ACCEPT_HYSTERESIS=${FACO_REORG_ACCEPT_HYSTERESIS:-0.01}
   FACO_REORG_ADAPTIVE_WARMUP_EVALS=${FACO_REORG_ADAPTIVE_WARMUP_EVALS:-5}
   FACO_REORG_MIN_EXEC_INTERVAL_US=${FACO_REORG_MIN_EXEC_INTERVAL_US:-60000000}
+  FACO_LACR_ENABLE=${FACO_LACR_ENABLE:-0}
 EOF
 
 echo "variant,reorg_enabled,run,benchmark,micros_per_op,ops_per_sec,seconds,mb_per_sec,result_dir" > "${SUMMARY_CSV}"

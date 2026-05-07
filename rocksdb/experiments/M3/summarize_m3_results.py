@@ -132,6 +132,7 @@ def collect_reorg_rows(root: Path) -> list[dict[str, str]]:
             for row in samples
             if row.get("adaptive_tau")
         ]
+        lacr_rows = [row for row in samples if int(to_float(row.get("lacr_enabled"))) == 1]
         rows.append(
             {
                 "variant": variant,
@@ -160,6 +161,15 @@ def collect_reorg_rows(root: Path) -> list[dict[str, str]]:
                 "max_net_benefit": f"{max([to_float(r.get('net_benefit')) for r in samples], default=0.0):.3f}",
                 "max_net_seen": debug.get("max_net_seen", ""),
                 "last_tau_trigger": f"{to_float(samples[-1].get('tau_trigger')) if samples else 0.0:.3f}",
+                "lacr_enabled": "1" if lacr_rows else "0",
+                "lacr_zone_score_max": f"{max([to_float(r.get('lacr_zone_score')) for r in lacr_rows], default=0.0):.3f}",
+                "lacr_synergy_bonus_avg": f"{mean([to_float(r.get('lacr_synergy_bonus')) for r in lacr_rows]):.3f}",
+                "lacr_waste_penalty_avg": f"{mean([to_float(r.get('lacr_waste_penalty')) for r in lacr_rows]):.3f}",
+                "lacr_latency_penalty_avg": f"{mean([to_float(r.get('lacr_latency_penalty')) for r in lacr_rows]):.3f}",
+                "net_m3_max": f"{max([to_float(r.get('net_m3')) for r in lacr_rows], default=0.0):.3f}",
+                "net_m4_max": f"{max([to_float(r.get('net_m4')) for r in lacr_rows], default=0.0):.3f}",
+                "active_compaction_files_max": f"{max([to_float(r.get('active_compaction_files')) for r in lacr_rows], default=0.0):.0f}",
+                "compaction_touched_zone_count": f"{sum(to_float(r.get('compaction_touched_zone')) for r in lacr_rows):.0f}",
                 "result_dir": str(run_dir),
             }
         )
@@ -323,6 +333,35 @@ def write_markdown(
                 mean([to_float(r.get("last_tau_trigger")) for r in group]),
             )
         )
+
+    if any(to_float(row.get("lacr_enabled")) > 0 for row in reorg_rows):
+        lines.extend(
+            [
+                "",
+                "## LACR Adjustments",
+                "",
+                "| variant | runs | max zone score | avg synergy | avg waste | avg latency | max Net_M3 | max Net_M4 | max active files | touched samples |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for variant, group in sorted(reorg_by_variant.items()):
+            lacr_group = [row for row in group if to_float(row.get("lacr_enabled")) > 0]
+            if not lacr_group:
+                continue
+            lines.append(
+                "| {} | {} | {:.3f} | {:.3f} | {:.3f} | {:.3f} | {:.3f} | {:.3f} | {:.0f} | {:.0f} |".format(
+                    variant,
+                    len(lacr_group),
+                    max([to_float(r.get("lacr_zone_score_max")) for r in lacr_group], default=0.0),
+                    mean([to_float(r.get("lacr_synergy_bonus_avg")) for r in lacr_group]),
+                    mean([to_float(r.get("lacr_waste_penalty_avg")) for r in lacr_group]),
+                    mean([to_float(r.get("lacr_latency_penalty_avg")) for r in lacr_group]),
+                    max([to_float(r.get("net_m3_max")) for r in lacr_group], default=0.0),
+                    max([to_float(r.get("net_m4_max")) for r in lacr_group], default=0.0),
+                    max([to_float(r.get("active_compaction_files_max")) for r in lacr_group], default=0.0),
+                    sum(to_float(r.get("compaction_touched_zone_count")) for r in lacr_group),
+                )
+            )
 
     out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

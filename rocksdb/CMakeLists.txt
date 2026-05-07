@@ -675,6 +675,7 @@ set(SOURCES
         db/dbformat.cc
         db/error_handler.cc
         db/event_helpers.cc
+        db/faco_lacr_state.cc
         db/experimental.cc
         db/external_sst_file_ingestion_job.cc
         db/file_indexer.cc

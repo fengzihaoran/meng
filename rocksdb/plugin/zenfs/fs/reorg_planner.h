@@ -90,6 +90,16 @@ class ReorgPlanner {
 
     // Global M3 rate limiter.  This is separate from per-victim cooldown.
     uint64_t min_exec_interval_us = 0;
+
+    // M4 LACR adjustment.  Defaults are intentionally conservative:
+    // active compaction creates penalties, while synergy is opt-in.
+    float lacr_w_synergy = 0.0f;
+    float lacr_w_waste = 1.0f;
+    float lacr_w_latency = 0.25f;
+    uint64_t lacr_active_compaction_penalty_bytes =
+        8ULL * 1024ULL * 1024ULL;
+    uint64_t lacr_recent_invalidation_bonus_bytes =
+        4ULL * 1024ULL * 1024ULL;
   };
 
   struct Plan {
@@ -160,11 +170,36 @@ class ReorgPlanner {
     uint64_t cooldown_skipped = 0;
     uint64_t tiny_skipped = 0;
     std::string reason;
+    int lacr_enabled = 0;
+    float lacr_zone_score = 0.0f;
+    float lacr_synergy_bonus = 0.0f;
+    float lacr_waste_penalty = 0.0f;
+    float lacr_latency_penalty = 0.0f;
+    float net_m3 = 0.0f;
+    float net_m4 = 0.0f;
+    size_t active_compaction_files = 0;
+    int compaction_touched_zone = 0;
+  };
+
+  struct LacrAdjustment {
+    int enabled = 0;
+    float zone_score = 0.0f;
+    float synergy_bonus = 0.0f;
+    float waste_penalty = 0.0f;
+    float latency_penalty = 0.0f;
+    float net_m3 = 0.0f;
+    float net_m4 = 0.0f;
+    size_t active_compaction_files = 0;
+    int compaction_touched_zone = 0;
   };
 
   static Config NormalizeConfig(Config cfg);
   static const char* TauModeName(TauMode mode);
   uint64_t EffectiveMinMigrateBytes() const;
+  bool LacrEnabled() const;
+  float ComputeM3Net(uint64_t zone_id) const;
+  LacrAdjustment ComputeLacrAdjustment(uint64_t zone_id,
+                                       float net_m3) const;
   float AdaptiveQuantileNoLock() const;
   float AdaptiveTauNoLock(float q) const;
   void RecordAdaptiveNetLocked(float net_benefit);
@@ -176,7 +211,8 @@ class ReorgPlanner {
                          uint64_t cooldown_skipped, uint64_t tiny_skipped,
                          const std::string& reason, float tau_trigger,
                          float adaptive_q, float adaptive_tau, bool warmup,
-                         bool rate_limited);
+                         bool rate_limited,
+                         const LacrAdjustment& lacr_adjustment);
 
   Config cfg_;
   FragmentationStateTable* frag_;

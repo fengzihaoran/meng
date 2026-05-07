@@ -16,6 +16,7 @@
 #include <sstream>
 #include <utility>
 
+#include "db/faco_lacr_state.h"
 #include "frag_state_table.h"
 #include "rocksdb/env.h"
 #include "zbd_zenfs.h"
@@ -99,6 +100,13 @@ ReorgPlanner::Config ReorgPlanner::NormalizeConfig(Config cfg) {
   cfg.adaptive_warmup_evals =
       std::max<uint64_t>(0, cfg.adaptive_warmup_evals);
   cfg.min_exec_interval_us = std::max<uint64_t>(0, cfg.min_exec_interval_us);
+  cfg.lacr_w_synergy = std::max(0.0f, cfg.lacr_w_synergy);
+  cfg.lacr_w_waste = std::max(0.0f, cfg.lacr_w_waste);
+  cfg.lacr_w_latency = std::max(0.0f, cfg.lacr_w_latency);
+  cfg.lacr_active_compaction_penalty_bytes =
+      std::max<uint64_t>(0, cfg.lacr_active_compaction_penalty_bytes);
+  cfg.lacr_recent_invalidation_bonus_bytes =
+      std::max<uint64_t>(0, cfg.lacr_recent_invalidation_bonus_bytes);
   return cfg;
 }
 
@@ -147,6 +155,17 @@ ReorgPlanner::Config ReorgPlanner::LoadConfigFromEnv() {
       "FACO_REORG_ADAPTIVE_WARMUP_EVALS", cfg.adaptive_warmup_evals);
   cfg.min_exec_interval_us = ReadEnvUint64(
       "FACO_REORG_MIN_EXEC_INTERVAL_US", cfg.min_exec_interval_us);
+  cfg.lacr_w_synergy =
+      ReadEnvFloat("FACO_LACR_W_SYNERGY", cfg.lacr_w_synergy);
+  cfg.lacr_w_waste = ReadEnvFloat("FACO_LACR_W_WASTE", cfg.lacr_w_waste);
+  cfg.lacr_w_latency =
+      ReadEnvFloat("FACO_LACR_W_LATENCY", cfg.lacr_w_latency);
+  cfg.lacr_active_compaction_penalty_bytes = ReadEnvUint64(
+      "FACO_LACR_ACTIVE_COMPACTION_PENALTY_BYTES",
+      cfg.lacr_active_compaction_penalty_bytes);
+  cfg.lacr_recent_invalidation_bonus_bytes = ReadEnvUint64(
+      "FACO_LACR_RECENT_INVALIDATION_BONUS_BYTES",
+      cfg.lacr_recent_invalidation_bonus_bytes);
   return NormalizeConfig(cfg);
 }
 
@@ -205,6 +224,8 @@ std::optional<ReorgPlanner::Plan> ReorgPlanner::NextPlan() {
   const uint64_t now_us = Env::Default()->NowMicros();
   Plan best;
   Plan best_observed;
+  LacrAdjustment best_lacr;
+  LacrAdjustment best_observed_lacr;
   bool found = false;
   bool observed = false;
   uint64_t cooldown_skipped = 0;
@@ -215,12 +236,15 @@ std::optional<ReorgPlanner::Plan> ReorgPlanner::NextPlan() {
     const uint64_t valid = std::min(state.valid_bytes, zone_capacity_);
     const float net = ComputeNet(zone_id);
     if (!std::isfinite(net)) continue;
+    const LacrAdjustment lacr_adjustment =
+        ComputeLacrAdjustment(zone_id, ComputeM3Net(zone_id));
 
     const Plan candidate{zone_id, net, valid};
     if (!observed || net > best_observed.net_benefit ||
         (net == best_observed.net_benefit &&
          zone_id < best_observed.victim_zone)) {
       best_observed = candidate;
+      best_observed_lacr = lacr_adjustment;
       observed = true;
     }
 
@@ -249,6 +273,7 @@ std::optional<ReorgPlanner::Plan> ReorgPlanner::NextPlan() {
     if (!found || net > best.net_benefit ||
         (net == best.net_benefit && zone_id < best.victim_zone)) {
       best = candidate;
+      best_lacr = lacr_adjustment;
       found = true;
     }
   }
@@ -283,7 +308,8 @@ std::optional<ReorgPlanner::Plan> ReorgPlanner::NextPlan() {
     RecordTraceLocked(now_us, best_observed, /*accepted=*/false,
                       cooldown_skipped, tiny_skipped, reason, tau_trigger,
                       last_adaptive_q_, last_adaptive_tau_,
-                      /*warmup=*/false, /*rate_limited=*/false);
+                      /*warmup=*/false, /*rate_limited=*/false,
+                      best_observed_lacr);
     return std::nullopt;
   }
 
@@ -329,7 +355,7 @@ std::optional<ReorgPlanner::Plan> ReorgPlanner::NextPlan() {
 
   RecordTraceLocked(now_us, best, accepted, cooldown_skipped, tiny_skipped,
                     accept_reason, tau_trigger, adaptive_q, adaptive_tau,
-                    warmup, rate_limited);
+                    warmup, rate_limited, best_lacr);
   if (!accepted) {
     rejected_plans_++;
     if (warmup) {
@@ -454,7 +480,18 @@ std::string ReorgPlanner::DebugString() const {
       << ", last_victim=" << last_plan_.victim_zone
       << ", last_net=" << last_plan_.net_benefit
       << ", last_valid_bytes=" << last_plan_.estimated_valid_bytes
-      << ", p99_ema_us=" << foreground_p99_ema_ << "}";
+      << ", p99_ema_us=" << foreground_p99_ema_;
+  if (LacrEnabled()) {
+    oss << ", lacr_enabled=1"
+        << ", lacr_w_synergy=" << cfg_.lacr_w_synergy
+        << ", lacr_w_waste=" << cfg_.lacr_w_waste
+        << ", lacr_w_latency=" << cfg_.lacr_w_latency
+        << ", lacr_active_compaction_penalty_bytes="
+        << cfg_.lacr_active_compaction_penalty_bytes
+        << ", lacr_recent_invalidation_bonus_bytes="
+        << cfg_.lacr_recent_invalidation_bonus_bytes;
+  }
+  oss << "}";
   return oss.str();
 }
 
@@ -464,7 +501,14 @@ std::string ReorgPlanner::ExportTraceCsv() const {
   oss << "now_us,victim_zone,net_benefit,tau_trigger,accepted,"
          "tau_mode,adaptive_q,adaptive_tau,warmup,rate_limited,"
          "current_budget,max_active_budget,estimated_valid_bytes,"
-         "cooldown_skipped,tiny_skipped,history_size,reason\n";
+         "cooldown_skipped,tiny_skipped,history_size,reason";
+  const bool lacr_enabled = LacrEnabled();
+  if (lacr_enabled) {
+    oss << ",lacr_enabled,lacr_zone_score,lacr_synergy_bonus,"
+           "lacr_waste_penalty,lacr_latency_penalty,net_m3,net_m4,"
+           "active_compaction_files,compaction_touched_zone";
+  }
+  oss << "\n";
   oss << std::setprecision(9);
   for (const TraceSample& sample : trace_) {
     oss << sample.now_us << "," << sample.victim_zone << ","
@@ -475,12 +519,30 @@ std::string ReorgPlanner::ExportTraceCsv() const {
         << sample.current_budget << "," << sample.max_active_budget << ","
         << sample.estimated_valid_bytes << "," << sample.cooldown_skipped
         << "," << sample.tiny_skipped << "," << sample.history_size << ","
-        << sample.reason << "\n";
+        << sample.reason;
+    if (lacr_enabled) {
+      oss << "," << sample.lacr_enabled << "," << sample.lacr_zone_score
+          << "," << sample.lacr_synergy_bonus << ","
+          << sample.lacr_waste_penalty << "," << sample.lacr_latency_penalty
+          << "," << sample.net_m3 << "," << sample.net_m4 << ","
+          << sample.active_compaction_files << ","
+          << sample.compaction_touched_zone;
+    }
+    oss << "\n";
   }
   return oss.str();
 }
 
 float ReorgPlanner::ComputeNet(uint64_t zone_id) const {
+  const float net_m3 = ComputeM3Net(zone_id);
+  return ComputeLacrAdjustment(zone_id, net_m3).net_m4;
+}
+
+bool ReorgPlanner::LacrEnabled() const {
+  return FacoLacrRuntimeEnabled();
+}
+
+float ReorgPlanner::ComputeM3Net(uint64_t zone_id) const {
   if (frag_ == nullptr || zone_capacity_ == 0) {
     return -std::numeric_limits<float>::infinity();
   }
@@ -499,6 +561,56 @@ float ReorgPlanner::ComputeNet(uint64_t zone_id) const {
       cfg_.w3 * static_cast<float>(valid) * cfg_.WA_factor;
   const float cost_contention = cfg_.w4 * ContentionPenalty(zone_id);
   return benefit_immediate + benefit_trend - cost_migrate - cost_contention;
+}
+
+ReorgPlanner::LacrAdjustment ReorgPlanner::ComputeLacrAdjustment(
+    uint64_t zone_id, float net_m3) const {
+  LacrAdjustment adjustment;
+  adjustment.net_m3 = net_m3;
+  adjustment.net_m4 = net_m3;
+
+#if FACO_ENABLE_LACR
+  if (!LacrEnabled() || !std::isfinite(net_m3)) {
+    return adjustment;
+  }
+
+  const FacoLacrState& lacr_state = GetFacoLacrState();
+  const uint64_t active_bytes =
+      lacr_state.ZoneActiveCompactionBytes(zone_id);
+  const uint64_t recent_invalidated_bytes =
+      lacr_state.ZoneRecentInvalidationBytes(zone_id);
+  const uint64_t active_penalty_cap =
+      cfg_.lacr_active_compaction_penalty_bytes;
+  const uint64_t waste_base =
+      active_penalty_cap == 0
+          ? active_bytes
+          : std::min(active_bytes, active_penalty_cap);
+  const uint64_t recent_bonus_cap =
+      cfg_.lacr_recent_invalidation_bonus_bytes;
+  const uint64_t bonus_base =
+      recent_bonus_cap == 0
+          ? recent_invalidated_bytes
+          : std::min(recent_invalidated_bytes, recent_bonus_cap);
+  const uint64_t latency_base = active_bytes == 0 ? 0 : waste_base;
+
+  adjustment.enabled = 1;
+  adjustment.zone_score =
+      static_cast<float>(lacr_state.ZoneCompactionScore(zone_id));
+  adjustment.synergy_bonus =
+      cfg_.lacr_w_synergy * static_cast<float>(bonus_base);
+  adjustment.waste_penalty = cfg_.lacr_w_waste * static_cast<float>(waste_base);
+  adjustment.latency_penalty =
+      cfg_.lacr_w_latency * static_cast<float>(latency_base);
+  adjustment.active_compaction_files = lacr_state.ActiveCompactionFiles();
+  adjustment.compaction_touched_zone =
+      lacr_state.WasZoneTouchedByCompaction(zone_id) ? 1 : 0;
+  adjustment.net_m4 = net_m3 + adjustment.synergy_bonus -
+                      adjustment.waste_penalty - adjustment.latency_penalty;
+#else
+  (void)zone_id;
+#endif
+
+  return adjustment;
 }
 
 float ReorgPlanner::ContentionPenalty(uint64_t zone_id) const {
@@ -601,16 +713,39 @@ void ReorgPlanner::RecordTraceLocked(uint64_t now_us, const Plan& plan,
                                      const std::string& reason,
                                      float tau_trigger, float adaptive_q,
                                      float adaptive_tau, bool warmup,
-                                     bool rate_limited) {
+                                     bool rate_limited,
+                                     const LacrAdjustment& lacr_adjustment) {
   if (trace_.size() == kMaxTraceSamples) {
     trace_.erase(trace_.begin());
   }
-  trace_.push_back(TraceSample{
-      now_us, plan.victim_zone, plan.net_benefit, tau_trigger,
-      TauModeName(cfg_.tau_mode), adaptive_q, adaptive_tau, accepted ? 1 : 0,
-      warmup ? 1 : 0, rate_limited ? 1 : 0, CurrentBudget(),
-      MaxActiveBudget(), adaptive_net_history_.size(),
-      plan.estimated_valid_bytes, cooldown_skipped, tiny_skipped, reason});
+  TraceSample sample;
+  sample.now_us = now_us;
+  sample.victim_zone = plan.victim_zone;
+  sample.net_benefit = plan.net_benefit;
+  sample.tau_trigger = tau_trigger;
+  sample.tau_mode = TauModeName(cfg_.tau_mode);
+  sample.adaptive_q = adaptive_q;
+  sample.adaptive_tau = adaptive_tau;
+  sample.accepted = accepted ? 1 : 0;
+  sample.warmup = warmup ? 1 : 0;
+  sample.rate_limited = rate_limited ? 1 : 0;
+  sample.current_budget = CurrentBudget();
+  sample.max_active_budget = MaxActiveBudget();
+  sample.history_size = adaptive_net_history_.size();
+  sample.estimated_valid_bytes = plan.estimated_valid_bytes;
+  sample.cooldown_skipped = cooldown_skipped;
+  sample.tiny_skipped = tiny_skipped;
+  sample.reason = reason;
+  sample.lacr_enabled = lacr_adjustment.enabled;
+  sample.lacr_zone_score = lacr_adjustment.zone_score;
+  sample.lacr_synergy_bonus = lacr_adjustment.synergy_bonus;
+  sample.lacr_waste_penalty = lacr_adjustment.waste_penalty;
+  sample.lacr_latency_penalty = lacr_adjustment.latency_penalty;
+  sample.net_m3 = lacr_adjustment.net_m3;
+  sample.net_m4 = lacr_adjustment.net_m4;
+  sample.active_compaction_files = lacr_adjustment.active_compaction_files;
+  sample.compaction_touched_zone = lacr_adjustment.compaction_touched_zone;
+  trace_.push_back(sample);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

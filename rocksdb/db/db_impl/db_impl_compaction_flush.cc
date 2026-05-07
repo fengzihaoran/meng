@@ -13,6 +13,7 @@
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
+#include "db/faco_lacr_state.h"
 #include "file/sst_file_manager_impl.h"
 #include "logging/logging.h"
 #include "monitoring/iostats_context_imp.h"
@@ -1713,7 +1714,8 @@ void DBImpl::NotifyOnCompactionBegin(ColumnFamilyData* cfd, Compaction* c,
                                      const Status& st,
                                      const CompactionJobStats& job_stats,
                                      int job_id) {
-  if (immutable_db_options_.listeners.empty()) {
+  const bool lacr_enabled = FacoLacrRuntimeEnabled();
+  if (immutable_db_options_.listeners.empty() && !lacr_enabled) {
     return;
   }
   mutex_.AssertHeld();
@@ -1732,6 +1734,9 @@ void DBImpl::NotifyOnCompactionBegin(ColumnFamilyData* cfd, Compaction* c,
   {
     CompactionJobInfo info{};
     BuildCompactionJobInfo(cfd, c, st, job_stats, job_id, &info);
+    if (lacr_enabled) {
+      GetFacoLacrState().MarkCompactionBegin(info);
+    }
     for (auto listener : immutable_db_options_.listeners) {
       listener->OnCompactionBegin(this, info);
     }
@@ -1743,7 +1748,9 @@ void DBImpl::NotifyOnCompactionBegin(ColumnFamilyData* cfd, Compaction* c,
 void DBImpl::NotifyOnCompactionCompleted(
     ColumnFamilyData* cfd, Compaction* c, const Status& st,
     const CompactionJobStats& compaction_job_stats, const int job_id) {
-  if (immutable_db_options_.listeners.size() == 0U) {
+  const bool lacr_enabled = FacoLacrRuntimeEnabled();
+  if (immutable_db_options_.listeners.size() == 0U && !lacr_enabled &&
+      !c->ShouldNotifyOnCompactionCompleted()) {
     return;
   }
   mutex_.AssertHeld();
@@ -1761,6 +1768,9 @@ void DBImpl::NotifyOnCompactionCompleted(
   {
     CompactionJobInfo info{};
     BuildCompactionJobInfo(cfd, c, st, compaction_job_stats, job_id, &info);
+    if (lacr_enabled || c->ShouldNotifyOnCompactionCompleted()) {
+      GetFacoLacrState().MarkCompactionEnd(info);
+    }
     for (auto listener : immutable_db_options_.listeners) {
       listener->OnCompactionCompleted(this, info);
     }
