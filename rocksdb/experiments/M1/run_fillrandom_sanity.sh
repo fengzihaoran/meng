@@ -73,6 +73,7 @@ fi
 
 FACO_DB_BENCH_ENV=()
 for env_name in \
+  FACO_CONFIG_PATH \
   FACO_BUDGET_B_MIN \
   FACO_BUDGET_B_MAX \
   FACO_BUDGET_KP \
@@ -111,7 +112,14 @@ for env_name in \
   FACO_REORG_ADAPTIVE_WARMUP_EVALS \
   FACO_REORG_MIN_EXEC_INTERVAL_US \
   FACO_REORG_FORCE_EVAL \
-  FACO_REORG_FREE_SPACE_TRIGGER_PERCENT; do
+  FACO_REORG_FREE_SPACE_TRIGGER_PERCENT \
+  FACO_LACR_ENABLE \
+  FACO_LACR_W_SYNERGY \
+  FACO_LACR_W_WASTE \
+  FACO_LACR_W_LATENCY \
+  FACO_LACR_ACTIVE_COMPACTION_PENALTY_BYTES \
+  FACO_LACR_RECENT_INVALIDATION_BONUS_BYTES \
+  FACO_FINAL_DUMP_ENABLE; do
   env_value="${!env_name-}"
   if [[ -n "${env_value}" ]]; then
     FACO_DB_BENCH_ENV+=("${env_name}=${env_value}")
@@ -120,6 +128,7 @@ done
 
 # Use NoCompression by default so M1 measures ZenFS/CFSM behavior without being
 # affected by optional Snappy linkage or CPU compression cost.
+set +e
 if [[ "${#FACO_DB_BENCH_ENV[@]}" -gt 0 ]]; then
   run_sudo env "${FACO_DB_BENCH_ENV[@]}" "${DB_BENCH}" "${DB_BENCH_ARGS[@]}" \
     2>&1 | tee "${RESULT_DIR}/db_bench.log"
@@ -127,11 +136,16 @@ else
   run_sudo "${DB_BENCH}" "${DB_BENCH_ARGS[@]}" \
     2>&1 | tee "${RESULT_DIR}/db_bench.log"
 fi
+db_bench_status=$?
+set -e
 
 # ZenFS writes CFSM exports to aux storage during shutdown. Copy them into the
 # run directory before the next run has a chance to clean the aux path.
 {
-  for export_file in faco_cfsm_summary.txt faco_cfsm_zones.csv; do
+  for export_file in \
+    faco_cfsm_summary.txt \
+    faco_cfsm_zones.csv \
+    faco_shutdown_stage.txt; do
     src="${ZENFS_AUX_PATH}/${export_file}"
     dst="${RESULT_DIR}/${export_file}"
     if run_sudo test -f "${src}"; then
@@ -145,12 +159,20 @@ fi
 
 # Capture the resulting ZenFS directory view. SKIP_LIST=1 is available if a
 # local environment has a list-only issue but the benchmark path works.
-if [[ "${SKIP_LIST:-0}" != "1" ]]; then
+if [[ "${db_bench_status}" -ne 0 ]]; then
+  echo "db_bench failed with status ${db_bench_status}; skipping zenfs list." \
+    | tee "${RESULT_DIR}/zenfs_list.log"
+elif [[ "${SKIP_LIST:-0}" != "1" ]]; then
   run_sudo "${ZENFS_TOOL}" list \
     --zbd="${ZBD}" \
     --path=rocksdbtest 2>&1 | tee "${RESULT_DIR}/zenfs_list.log"
 else
   echo "SKIP_LIST=1, skipping zenfs list." | tee "${RESULT_DIR}/zenfs_list.log"
+fi
+
+if [[ "${db_bench_status}" -ne 0 ]]; then
+  echo "db_bench failed with status ${db_bench_status}. Logs are in ${RESULT_DIR}" >&2
+  exit "${db_bench_status}"
 fi
 
 echo "M1 db_bench sanity completed. Logs are in ${RESULT_DIR}"

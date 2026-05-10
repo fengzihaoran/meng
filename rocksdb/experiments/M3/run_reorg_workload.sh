@@ -47,6 +47,7 @@ M3 reorg workload:
   FACO_REORG_FORCE_EVAL=${FACO_REORG_FORCE_EVAL:-1}
   FACO_REORG_FREE_SPACE_TRIGGER_PERCENT=${FACO_REORG_FREE_SPACE_TRIGGER_PERCENT:-100}
   FACO_LACR_ENABLE=${FACO_LACR_ENABLE:-0}
+  FACO_CONFIG_PATH=${FACO_CONFIG_PATH:-}
 EOF
 
 BUILD_RELEASE_DIR="${BUILD_RELEASE_DIR}" \
@@ -94,6 +95,7 @@ FACO_LACR_W_WASTE="${FACO_LACR_W_WASTE:-1}" \
 FACO_LACR_W_LATENCY="${FACO_LACR_W_LATENCY:-0.25}" \
 FACO_LACR_ACTIVE_COMPACTION_PENALTY_BYTES="${FACO_LACR_ACTIVE_COMPACTION_PENALTY_BYTES:-8388608}" \
 FACO_LACR_RECENT_INVALIDATION_BONUS_BYTES="${FACO_LACR_RECENT_INVALIDATION_BONUS_BYTES:-4194304}" \
+FACO_CONFIG_PATH="${FACO_CONFIG_PATH:-}" \
   bash "${REPO_ROOT}/experiments/M1/run_fillrandom_sanity.sh"
 
 {
@@ -103,7 +105,11 @@ FACO_LACR_RECENT_INVALIDATION_BONUS_BYTES="${FACO_LACR_RECENT_INVALIDATION_BONUS
     faco_reorg_summary.txt \
     faco_reorg_trace.csv \
     faco_lacr_trace.csv \
-    faco_runtime_metrics.txt; do
+    faco_runtime_metrics.txt \
+    faco_metrics.txt \
+    faco_metrics.json \
+    faco_metrics.prom \
+    faco_config_effective.txt; do
     src="${ZENFS_AUX_PATH}/${export_file}"
     dst="${RESULT_DIR}/${export_file}"
     if run_sudo test -f "${src}"; then

@@ -82,7 +82,11 @@ copy_faco_exports() {
       faco_reorg_summary.txt \
       faco_reorg_trace.csv \
       faco_lacr_trace.csv \
-      faco_runtime_metrics.txt; do
+      faco_runtime_metrics.txt \
+      faco_metrics.txt \
+      faco_metrics.json \
+      faco_metrics.prom \
+      faco_config_effective.txt; do
       local src="${ZENFS_AUX_PATH}/${export_file}"
       local dst="${run_dir}/${export_file}"
       if run_sudo test -f "${src}"; then
@@ -158,6 +162,7 @@ run_variant() {
     FACO_LACR_W_LATENCY="${FACO_LACR_W_LATENCY:-0.25}" \
     FACO_LACR_ACTIVE_COMPACTION_PENALTY_BYTES="${FACO_LACR_ACTIVE_COMPACTION_PENALTY_BYTES:-8388608}" \
     FACO_LACR_RECENT_INVALIDATION_BONUS_BYTES="${FACO_LACR_RECENT_INVALIDATION_BONUS_BYTES:-4194304}" \
+    FACO_CONFIG_PATH="${FACO_CONFIG_PATH:-}" \
       bash "${REPO_ROOT}/experiments/M1/run_fillrandom_sanity.sh"
 
     copy_faco_exports "${run_dir}"

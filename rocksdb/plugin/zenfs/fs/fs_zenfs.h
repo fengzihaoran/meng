@@ -14,6 +14,7 @@ namespace fs = filesystem_utility;
 namespace fs = std::filesystem;
 #endif
 
+#include <atomic>
 #include <memory>
 #include <thread>
 
@@ -148,7 +149,7 @@ class ZenFS : public FileSystemWrapper {
   std::shared_ptr<Logger> GetLogger() { return logger_; }
 
   std::unique_ptr<std::thread> gc_worker_ = nullptr;
-  bool run_gc_worker_ = false;
+  std::atomic_bool run_gc_worker_{false};
   std::unique_ptr<ReorgPlanner> reorg_planner_ = nullptr;
 
   struct ZenFSMetadataWriter : public MetadataWriter {

@@ -27,6 +27,8 @@
 #include "metrics_prometheus.h"
 #endif
 #include "db/faco_lacr_state.h"
+#include "faco_config.h"
+#include "faco_metrics.h"
 #include "frag_state_table.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "snapshot.h"
@@ -347,16 +349,37 @@ ZenFS::ZenFS(ZonedBlockDevice* zbd, std::shared_ptr<FileSystem> aux_fs,
 
 ZenFS::~ZenFS() {
   Status s;
-  Info(logger_, "ZenFS shutting down");
-  zbd_->LogZoneUsage();
-  LogFiles();
+  auto record_destructor_stage = [this](const std::string& stage) {
+    if (superblock_ == nullptr) {
+      return;
+    }
+    std::ofstream marker(superblock_->GetAuxFsPath() +
+                             "/faco_shutdown_stage.txt",
+                         std::ios_base::app);
+    if (marker.good()) {
+      marker << stage << "\n";
+    }
+  };
 
+  record_destructor_stage("destructor_begin");
+  Info(logger_, "ZenFS shutting down");
   if (gc_worker_) {
-    run_gc_worker_ = false;
+    record_destructor_stage("gc_stop_begin");
+    run_gc_worker_.store(false, std::memory_order_release);
     gc_worker_->join();
+    record_destructor_stage("gc_stop_done");
   }
 
+  record_destructor_stage("log_zone_usage_begin");
+  zbd_->LogZoneUsage();
+  record_destructor_stage("log_zone_usage_done");
+  record_destructor_stage("log_files_begin");
+  LogFiles();
+  record_destructor_stage("log_files_done");
+
+  record_destructor_stage("dump_begin");
   DumpFragmentationState();
+  record_destructor_stage("dump_done");
 
   auto frag_table = zbd_->GetFragmentationStateTable();
   if (frag_table != nullptr) {
@@ -366,12 +389,19 @@ ZenFS::~ZenFS() {
   GetFacoLacrState().SetFileZoneMapFn(nullptr);
 #endif  // FACO_ENABLE_LACR
 
+  record_destructor_stage("clear_files_begin");
   meta_log_.reset(nullptr);
   ClearFiles();
+  record_destructor_stage("delete_zbd_begin");
   delete zbd_;
+  record_destructor_stage("destructor_complete");
 }
 
 void ZenFS::DumpFragmentationState() {
+  if (!ReadFacoEnvBool("FACO_FINAL_DUMP_ENABLE", /*default_value=*/true)) {
+    return;
+  }
+
   auto frag_table = zbd_->GetFragmentationStateTable();
   if (frag_table == nullptr || superblock_ == nullptr) {
     return;
@@ -393,7 +423,21 @@ void ZenFS::DumpFragmentationState() {
   const std::string lacr_trace_path = aux_path + "/faco_lacr_trace.csv";
   const std::string runtime_metrics_path =
       aux_path + "/faco_runtime_metrics.txt";
+  const std::string metrics_text_path = aux_path + "/faco_metrics.txt";
+  const std::string metrics_json_path = aux_path + "/faco_metrics.json";
+  const std::string metrics_prometheus_path =
+      aux_path + "/faco_metrics.prom";
+  const std::string config_debug_path = aux_path + "/faco_config_effective.txt";
+  const std::string shutdown_stage_path = aux_path + "/faco_shutdown_stage.txt";
 
+  auto record_stage = [&shutdown_stage_path](const std::string& stage) {
+    std::ofstream marker(shutdown_stage_path, std::ios_base::app);
+    if (marker.good()) {
+      marker << stage << "\n";
+    }
+  };
+
+  record_stage("begin");
   std::ofstream summary(summary_path);
   if (summary.good()) {
     summary << frag_table->SummaryString(/*top_k=*/10);
@@ -402,6 +446,7 @@ void ZenFS::DumpFragmentationState() {
          summary_path.c_str());
   }
 
+  record_stage("cfsm_summary");
   std::ofstream csv(csv_path);
   if (csv.good()) {
     csv << frag_table->ExportCsv();
@@ -410,6 +455,7 @@ void ZenFS::DumpFragmentationState() {
          csv_path.c_str());
   }
 
+  record_stage("cfsm_csv");
   const std::string budget_summary = zbd_->GetZoneBudgetDebugString();
   if (!budget_summary.empty()) {
     std::ofstream budget_summary_file(budget_summary_path);
@@ -421,6 +467,7 @@ void ZenFS::DumpFragmentationState() {
     }
   }
 
+  record_stage("budget_summary");
   const std::string budget_trace = zbd_->ExportZoneBudgetTraceCsv();
   if (!budget_trace.empty()) {
     std::ofstream budget_trace_file(budget_trace_path);
@@ -432,10 +479,13 @@ void ZenFS::DumpFragmentationState() {
     }
   }
 
+  record_stage("budget_trace");
+  std::string reorg_summary;
   if (reorg_planner_ != nullptr) {
+    reorg_summary = reorg_planner_->DebugString();
     std::ofstream reorg_summary_file(reorg_summary_path);
     if (reorg_summary_file.good()) {
-      reorg_summary_file << reorg_planner_->DebugString() << "\n";
+      reorg_summary_file << reorg_summary << "\n";
     } else {
       Warn(logger_, "FACO reorg: failed to write summary to %s",
            reorg_summary_path.c_str());
@@ -451,11 +501,26 @@ void ZenFS::DumpFragmentationState() {
     }
   }
 
+  record_stage("reorg");
+  std::string lacr_summary;
 #if FACO_ENABLE_LACR
   if (FacoLacrRuntimeEnabled()) {
+    record_stage("lacr_debug_begin");
+    lacr_summary = GetFacoLacrState().DebugString();
+    record_stage("lacr_debug_done");
     std::ofstream lacr_trace_file(lacr_trace_path);
     if (lacr_trace_file.good()) {
-      lacr_trace_file << GetFacoLacrState().ExportTraceCsv();
+      record_stage("lacr_trace_export_begin");
+      if (ReadFacoEnvBool("FACO_LACR_FULL_TRACE_EXPORT",
+                          /*default_value=*/false)) {
+        lacr_trace_file << GetFacoLacrState().ExportTraceCsv();
+      } else {
+        lacr_trace_file
+            << "event,now_us,job_id,input_level,output_level,"
+               "total_input_bytes,total_output_bytes,input_files,output_files,"
+               "touched_zones,active_compaction_files\n";
+      }
+      record_stage("lacr_trace_export_done");
     } else {
       Warn(logger_, "FACO LACR: failed to write trace to %s",
            lacr_trace_path.c_str());
@@ -463,13 +528,61 @@ void ZenFS::DumpFragmentationState() {
   }
 #endif  // FACO_ENABLE_LACR
 
+  record_stage("lacr");
+  const std::string runtime_metrics_text = zbd_->ExportRuntimeMetricsString();
   std::ofstream runtime_metrics(runtime_metrics_path);
   if (runtime_metrics.good()) {
-    runtime_metrics << zbd_->ExportRuntimeMetricsString();
+    runtime_metrics << runtime_metrics_text;
   } else {
     Warn(logger_, "FACO runtime: failed to write metrics to %s",
          runtime_metrics_path.c_str());
   }
+
+  record_stage("runtime_metrics");
+  FacoMetricsSnapshot metrics_snapshot;
+  metrics_snapshot.AddFragmentationMetrics(frag_table.get());
+  metrics_snapshot.AddBudgetMetrics(budget_summary);
+  metrics_snapshot.AddReorgMetrics(reorg_summary);
+  metrics_snapshot.AddLacrMetrics(lacr_summary);
+  metrics_snapshot.AddRuntimeMetrics(runtime_metrics_text);
+
+  record_stage("metrics_snapshot");
+  std::ofstream metrics_text(metrics_text_path);
+  if (metrics_text.good()) {
+    metrics_text << metrics_snapshot.ToText();
+  } else {
+    Warn(logger_, "FACO metrics: failed to write text metrics to %s",
+         metrics_text_path.c_str());
+  }
+
+  std::ofstream metrics_json(metrics_json_path);
+  if (metrics_json.good()) {
+    metrics_json << metrics_snapshot.ToJson();
+  } else {
+    Warn(logger_, "FACO metrics: failed to write JSON metrics to %s",
+         metrics_json_path.c_str());
+  }
+
+  std::ofstream metrics_prometheus(metrics_prometheus_path);
+  if (metrics_prometheus.good()) {
+    metrics_prometheus << metrics_snapshot.ToPrometheusText();
+  } else {
+    Warn(logger_, "FACO metrics: failed to write Prometheus metrics to %s",
+         metrics_prometheus_path.c_str());
+  }
+
+  record_stage("metrics_files");
+  const FacoConfig faco_config = FacoConfig::LoadFromEnv();
+  if (faco_config.loaded()) {
+    std::ofstream config_debug(config_debug_path);
+    if (config_debug.good()) {
+      config_debug << faco_config.DebugString() << "\n";
+    } else {
+      Warn(logger_, "FACO config: failed to write debug config to %s",
+           config_debug_path.c_str());
+    }
+  }
+  record_stage("complete");
 }
 
 void ZenFS::EnableReorgPlanner() {
@@ -560,8 +673,11 @@ IOStatus ZenFS::ExecuteReorgPlan(const ReorgPlanner::Plan& plan) {
 }
 
 void ZenFS::GCWorker() {
-  while (run_gc_worker_) {
+  while (run_gc_worker_.load(std::memory_order_acquire)) {
     usleep(1000 * 1000 * 10);
+    if (!run_gc_worker_.load(std::memory_order_acquire)) {
+      break;
+    }
     const uint64_t now_us = Env::Default()->NowMicros();
     auto frag_table = zbd_->GetFragmentationStateTable();
     if (frag_table != nullptr) {
@@ -587,9 +703,15 @@ void ZenFS::GCWorker() {
 
 #if FACO_ENABLE_REORG && FACO_ENABLE_CFSM
     if (reorg_planner_ != nullptr && should_eval_reorg) {
+      if (!run_gc_worker_.load(std::memory_order_acquire)) {
+        break;
+      }
       std::optional<ReorgPlanner::Plan> plan = reorg_planner_->NextPlan();
       if (plan.has_value()) {
         m3_plan_attempted = true;
+        if (!run_gc_worker_.load(std::memory_order_acquire)) {
+          break;
+        }
         IOStatus s = reorg_planner_->Execute(*plan);
         if (!s.ok()) {
           Error(logger_, "FACO reorg failed: %s", s.ToString().c_str());
@@ -604,6 +726,9 @@ void ZenFS::GCWorker() {
       continue;
     }
 
+    if (!run_gc_worker_.load(std::memory_order_acquire)) {
+      break;
+    }
     options.zone_ = 1;
     options.zone_file_ = 1;
     options.log_garbage_ = 1;
@@ -636,6 +761,9 @@ void ZenFS::GCWorker() {
       IOStatus s;
       Info(logger_, "Garbage collecting %d extents \n",
            (int)migrate_exts.size());
+      if (!run_gc_worker_.load(std::memory_order_acquire)) {
+        break;
+      }
       s = MigrateExtents(migrate_exts);
       if (!s.ok()) {
         Error(logger_, "Garbage collection failed");
@@ -1808,7 +1936,7 @@ Status ZenFS::Mount(bool readonly) {
 
     if (superblock_->IsGCEnabled()) {
       Info(logger_, "Starting garbage collection worker");
-      run_gc_worker_ = true;
+      run_gc_worker_.store(true, std::memory_order_release);
       gc_worker_.reset(new std::thread(&ZenFS::GCWorker, this));
     }
   }
@@ -2164,7 +2292,7 @@ IOStatus ZenFS::MigrateFileExtents(
     }
 
     // If the file doesn't exist, skip
-    if (GetFileNoLock(fname) == nullptr) {
+    if (GetFile(fname) == nullptr) {
       Info(logger_, "Migrate file not exist anymore.");
       zbd_->ReleaseMigrateZone(target_zone);
       break;

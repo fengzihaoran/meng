@@ -24,6 +24,27 @@ internal APIs may be changed without warning.
 
 Questions and discussions are welcome on the [RocksDB Developers Public](https://www.facebook.com/groups/rocksdb.dev/) Facebook group and [email list](https://groups.google.com/g/rocksdb) on Google Groups.
 
+## FACO-LACR Experiments
+
+This checkout contains local FACO-LACR ZenFS experiment code under
+`plugin/zenfs` and benchmark orchestration under `experiments/M5`.
+
+Offline summary generation:
+
+```bash
+python3 experiments/M5/summarize_traces.py <result-root> <result-root>/m5_summary.md
+```
+
+Device benchmarks are guarded because they may format the configured ZenFS
+target. Run them only after selecting the target device deliberately:
+
+```bash
+CONFIRM_DEVICE_BENCH=1 ZBD=nvme0n1 M5_RUNS=5 bash experiments/M5/run_all.sh
+```
+
+See `experiments/M5/README.md` for the ablation matrix, exported FACO metrics,
+and benchmark protocol.
+
 ## License
 
 RocksDB is dual-licensed under both the GPLv2 (found in the COPYING file in the root directory) and Apache 2.0 License (found in the LICENSE.Apache file in the root directory).  You may select, at your option, one of the above-listed licenses.

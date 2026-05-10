@@ -1139,9 +1139,11 @@ else()
 endif()
 
 option(WITH_JNI "build with JNI" OFF)
-# Tests are excluded from Release builds
-CMAKE_DEPENDENT_OPTION(WITH_TESTS "build with tests" ON
-  "CMAKE_BUILD_TYPE STREQUAL Debug" OFF)
+if(CMAKE_BUILD_TYPE STREQUAL Debug)
+  option(WITH_TESTS "build with tests" ON)
+else()
+  option(WITH_TESTS "build with tests" OFF)
+endif()
 option(WITH_BENCHMARK_TOOLS "build with benchmarks" ON)
 option(WITH_CORE_TOOLS "build with ldb and sst_dump" ON)
 option(WITH_TOOLS "build with tools" ON)
@@ -1496,7 +1498,11 @@ if(WITH_TESTS)
         EXCLUDE_FROM_DEFAULT_BUILD_RELWITHDEBINFO 1
         OUTPUT_NAME ${exename}${ARTIFACT_SUFFIX}
       )
-      target_link_libraries(${exename}${ARTIFACT_SUFFIX} testutillib${ARTIFACT_SUFFIX} testharness gtest ${THIRDPARTY_LIBS} ${ROCKSDB_LIB})
+      if(sourcefile MATCHES "^plugin/zenfs/tests/.*_test\\.cc$")
+        target_link_libraries(${exename}${ARTIFACT_SUFFIX} gtest ${THIRDPARTY_LIBS} ${ROCKSDB_LIB})
+      else()
+        target_link_libraries(${exename}${ARTIFACT_SUFFIX} testutillib${ARTIFACT_SUFFIX} testharness gtest ${THIRDPARTY_LIBS} ${ROCKSDB_LIB})
+      endif()
       if(NOT "${exename}" MATCHES "db_sanity_test")
         gtest_discover_tests(${exename} DISCOVERY_TIMEOUT 120)
         add_dependencies(rocksdb_check ${exename}${ARTIFACT_SUFFIX})

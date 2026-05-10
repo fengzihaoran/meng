@@ -1,0 +1,41 @@
+{
+  "frag_state": {
+    "ema_alpha": 0.3,
+    "tick_interval_us": 1000000
+  },
+  "budget_ctrl": {
+    "B_min": 2,
+    "B_max": 12,
+    "Kp": 0.6,
+    "Ki": 0.05,
+    "P_target": 0.0,
+    "theta_zvdr": 0.05
+  },
+  "reorg_planner": {
+    "w1": 0.4,
+    "w2": 0.3,
+    "w3": 0.2,
+    "w4": 0.1,
+    "WA_factor": 1.0,
+    "T_horizon_us": 60000000,
+    "tau_trigger_init": 5242880
+  },
+  "lacr": {
+    "enable_l1": true,
+    "enable_l2": false,
+    "w_synergy": 0.0,
+    "w_waste": 1.0,
+    "w_latency": 0.25,
+    "active_compaction_penalty_bytes": 8388608,
+    "recent_invalidation_bonus_bytes": 4194304,
+    "lifetime_ema_alpha": 0.2,
+    "lifetime_short_threshold_us": 300000000,
+    "lifetime_medium_threshold_us": 3600000000,
+    "warmup_samples_per_level": 10,
+    "pool_ratio_initial": [30, 40, 30],
+    "default_lifetime_us_per_level": [
+      300000000, 900000000, 1800000000,
+      3600000000, 7200000000, 7200000000, 7200000000
+    ]
+  }
+}

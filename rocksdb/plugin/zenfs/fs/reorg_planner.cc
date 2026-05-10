@@ -17,6 +17,7 @@
 #include <utility>
 
 #include "db/faco_lacr_state.h"
+#include "faco_config.h"
 #include "frag_state_table.h"
 #include "rocksdb/env.h"
 #include "zbd_zenfs.h"
@@ -112,6 +113,48 @@ ReorgPlanner::Config ReorgPlanner::NormalizeConfig(Config cfg) {
 
 ReorgPlanner::Config ReorgPlanner::LoadConfigFromEnv() {
   Config cfg;
+  const FacoConfig file_cfg = FacoConfig::LoadFromEnv();
+  if (file_cfg.loaded()) {
+    if (file_cfg.reorg_planner.w1) {
+      cfg.w1 = *file_cfg.reorg_planner.w1;
+    }
+    if (file_cfg.reorg_planner.w2) {
+      cfg.w2 = *file_cfg.reorg_planner.w2;
+    }
+    if (file_cfg.reorg_planner.w3) {
+      cfg.w3 = *file_cfg.reorg_planner.w3;
+    }
+    if (file_cfg.reorg_planner.w4) {
+      cfg.w4 = *file_cfg.reorg_planner.w4;
+    }
+    if (file_cfg.reorg_planner.WA_factor) {
+      cfg.WA_factor = *file_cfg.reorg_planner.WA_factor;
+    }
+    if (file_cfg.reorg_planner.T_horizon_us) {
+      cfg.T_horizon_us = *file_cfg.reorg_planner.T_horizon_us;
+    }
+    if (file_cfg.reorg_planner.tau_trigger_init) {
+      cfg.tau_trigger_init = *file_cfg.reorg_planner.tau_trigger_init;
+    }
+    if (file_cfg.lacr.w_synergy) {
+      cfg.lacr_w_synergy = *file_cfg.lacr.w_synergy;
+    }
+    if (file_cfg.lacr.w_waste) {
+      cfg.lacr_w_waste = *file_cfg.lacr.w_waste;
+    }
+    if (file_cfg.lacr.w_latency) {
+      cfg.lacr_w_latency = *file_cfg.lacr.w_latency;
+    }
+    if (file_cfg.lacr.active_compaction_penalty_bytes) {
+      cfg.lacr_active_compaction_penalty_bytes =
+          *file_cfg.lacr.active_compaction_penalty_bytes;
+    }
+    if (file_cfg.lacr.recent_invalidation_bonus_bytes) {
+      cfg.lacr_recent_invalidation_bonus_bytes =
+          *file_cfg.lacr.recent_invalidation_bonus_bytes;
+    }
+  }
+
   cfg.w1 = ReadEnvFloat("FACO_REORG_W1", cfg.w1);
   cfg.w2 = ReadEnvFloat("FACO_REORG_W2", cfg.w2);
   cfg.w3 = ReadEnvFloat("FACO_REORG_W3", cfg.w3);

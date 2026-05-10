@@ -29,6 +29,7 @@
 #include <utility>
 #include <vector>
 
+#include "faco_config.h"
 #include "frag_state_table.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
@@ -104,6 +105,31 @@ size_t ReadEnvSize(const char* name, size_t default_value) {
 
 ZoneBudgetCtrl::Config LoadZoneBudgetConfig(unsigned int hard_limit) {
   ZoneBudgetCtrl::Config cfg;
+  const FacoConfig file_cfg = FacoConfig::LoadFromEnv();
+  if (file_cfg.loaded()) {
+    if (file_cfg.budget_ctrl.B_min) {
+      cfg.B_min = *file_cfg.budget_ctrl.B_min;
+    }
+    if (file_cfg.budget_ctrl.B_max) {
+      cfg.B_max = *file_cfg.budget_ctrl.B_max;
+    }
+    if (file_cfg.budget_ctrl.Kp) {
+      cfg.Kp = *file_cfg.budget_ctrl.Kp;
+    }
+    if (file_cfg.budget_ctrl.Ki) {
+      cfg.Ki = *file_cfg.budget_ctrl.Ki;
+    }
+    if (file_cfg.budget_ctrl.P_target) {
+      cfg.P_target = *file_cfg.budget_ctrl.P_target;
+    }
+    if (file_cfg.budget_ctrl.theta_zvdr) {
+      cfg.theta_zvdr = *file_cfg.budget_ctrl.theta_zvdr;
+    }
+    if (file_cfg.budget_ctrl.update_interval_us) {
+      cfg.update_interval_us = *file_cfg.budget_ctrl.update_interval_us;
+    }
+  }
+
   cfg.B_min = ReadEnvInt("FACO_BUDGET_B_MIN", cfg.B_min);
   cfg.B_max = ReadEnvInt("FACO_BUDGET_B_MAX", cfg.B_max);
   cfg.Kp = ReadEnvFloat("FACO_BUDGET_KP", cfg.Kp);
@@ -354,9 +380,14 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   start_time_ = time(NULL);
 #if FACO_ENABLE_CFSM
   if (faco_runtime_enabled_) {
+    float ema_alpha = 0.3f;
+    const FacoConfig file_cfg = FacoConfig::LoadFromEnv();
+    if (file_cfg.loaded() && file_cfg.frag_state.ema_alpha) {
+      ema_alpha = *file_cfg.frag_state.ema_alpha;
+    }
     std::lock_guard<std::mutex> lock(FragTablesMutex());
     auto frag_table = std::make_shared<FragmentationStateTable>(
-        zbd_be_->GetZoneSize(), zbd_be_->GetNrZones());
+        zbd_be_->GetZoneSize(), zbd_be_->GetNrZones(), ema_alpha);
     // Establish an initial time reference before any writes happen.  Without
     // this first sample, a final shutdown Tick would only initialize ZVDR
     // history and miss validity decay caused by overwrites/compaction.
