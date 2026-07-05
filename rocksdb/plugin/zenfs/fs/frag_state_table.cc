@@ -224,6 +224,21 @@ ZoneFragState FragmentationStateTable::Snapshot(uint64_t zone_id) const {
   return states_[zone_id];
 }
 
+size_t FragmentationStateTable::CountHighFragZones() const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  size_t high_frag_zones = 0;
+  for (const ZoneFragState& state : states_) {
+    if (state.valid_bytes == 0) {
+      continue;
+    }
+    if (state.fragment_class == FACO_COLD_HIGH ||
+        state.fragment_class == FACO_HOT_HIGH) {
+      high_frag_zones++;
+    }
+  }
+  return high_frag_zones;
+}
+
 std::string FragmentationStateTable::DebugString() const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
   std::ostringstream oss;

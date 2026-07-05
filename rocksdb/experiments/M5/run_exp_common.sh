@@ -72,6 +72,10 @@ M5 protocol:
   ZBD=${ZBD}
   ZENFS_AUX_PATH=${ZENFS_AUX_PATH}
   DB_PATH=${DB_PATH}
+  FACO_GC_INTERVAL_US=${FACO_GC_INTERVAL_US:-default}
+  FACO_HIGH_FRAG_BACKLOG_TRIGGER=${FACO_HIGH_FRAG_BACKLOG_TRIGGER:-default}
+  FACO_REORG_EXTRA_PER_GC=${FACO_REORG_EXTRA_PER_GC:-default}
+  FACO_REORG_MAX_EXTRA_VALID_MB=${FACO_REORG_MAX_EXTRA_VALID_MB:-default}
 EOF
 }
 
@@ -106,6 +110,7 @@ m5_copy_exports() {
       faco_budget_trace.csv \
       faco_reorg_summary.txt \
       faco_reorg_trace.csv \
+      faco_reorg_candidates.csv \
       faco_lacr_trace.csv \
       faco_runtime_metrics.txt \
       faco_metrics.txt \
@@ -152,6 +157,10 @@ m5_run_db_bench_workload() {
   ZENFS_ENABLE_GC="${ZENFS_ENABLE_GC:-1}" \
   EXTRA_DB_BENCH_ARGS="${EXTRA_DB_BENCH_ARGS:-}" \
   FACO_CONFIG_PATH="${M5_CONFIG}" \
+  FACO_GC_INTERVAL_US="${FACO_GC_INTERVAL_US:-}" \
+  FACO_HIGH_FRAG_BACKLOG_TRIGGER="${FACO_HIGH_FRAG_BACKLOG_TRIGGER:-}" \
+  FACO_REORG_EXTRA_PER_GC="${FACO_REORG_EXTRA_PER_GC:-}" \
+  FACO_REORG_MAX_EXTRA_VALID_MB="${FACO_REORG_MAX_EXTRA_VALID_MB:-}" \
   FACO_LACR_ENABLE="${FACO_LACR_ENABLE:-0}" \
   FACO_FINAL_DUMP_ENABLE="${FACO_FINAL_DUMP_ENABLE:-1}" \
     bash "${M5_REPO_ROOT}/experiments/M1/run_fillrandom_sanity.sh"

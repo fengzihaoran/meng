@@ -140,6 +140,9 @@ class ReorgPlanner {
   /** Exports sampled M3 decisions as CSV for experiments/M3 scripts. */
   std::string ExportTraceCsv() const;
 
+  /** Exports per-evaluation top-k candidate diagnostics as CSV. */
+  std::string ExportCandidateTraceCsv() const;
+
   virtual ~ReorgPlanner() = default;
  protected:
   // Virtual so M4 LACR can inject compaction synergy without editing M3.
@@ -170,6 +173,40 @@ class ReorgPlanner {
     uint64_t cooldown_skipped = 0;
     uint64_t tiny_skipped = 0;
     std::string reason;
+    int lacr_enabled = 0;
+    float lacr_zone_score = 0.0f;
+    float lacr_synergy_bonus = 0.0f;
+    float lacr_waste_penalty = 0.0f;
+    float lacr_latency_penalty = 0.0f;
+    float net_m3 = 0.0f;
+    float net_m4 = 0.0f;
+    size_t active_compaction_files = 0;
+    int compaction_touched_zone = 0;
+  };
+
+  struct CandidateTraceSample {
+    uint64_t eval_id = 0;
+    uint64_t now_us = 0;
+    size_t candidate_rank = 0;
+    uint64_t zone_id = 0;
+    uint64_t valid_bytes = 0;
+    uint64_t invalid_bytes = 0;
+    float valid_ratio = 0.0f;
+    float invalid_ratio = 0.0f;
+    float rbd = 0.0f;
+    float zvdr_ema = 0.0f;
+    int fragment_class = 0;
+    int lifetime_class = 0;
+    uint64_t min_migrate_bytes = 0;
+    int tiny_filtered = 0;
+    int cooldown_filtered = 0;
+    int actionable = 0;
+    int best_observed = 0;
+    int selected = 0;
+    int accepted = 0;
+    std::string reason;
+    int current_budget = 0;
+    int max_active_budget = 0;
     int lacr_enabled = 0;
     float lacr_zone_score = 0.0f;
     float lacr_synergy_bonus = 0.0f;
@@ -213,6 +250,8 @@ class ReorgPlanner {
                          float adaptive_q, float adaptive_tau, bool warmup,
                          bool rate_limited,
                          const LacrAdjustment& lacr_adjustment);
+  void RecordCandidateTraceLocked(
+      const std::vector<CandidateTraceSample>& samples);
 
   Config cfg_;
   FragmentationStateTable* frag_;
@@ -242,6 +281,7 @@ class ReorgPlanner {
   std::unordered_map<uint64_t, uint64_t> zone_cooldown_until_us_;
   std::vector<float> adaptive_net_history_;
   std::vector<TraceSample> trace_;
+  std::vector<CandidateTraceSample> candidate_trace_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

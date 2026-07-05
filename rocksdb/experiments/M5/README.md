@@ -59,12 +59,19 @@ Use the experiments this way:
 | Exp-3 | LACR on/off movement behavior |
 | Exp-4 | FACO-internal ablation and primary claim table |
 
-`summarize_traces.py` writes two paper-table inputs:
+`summarize_traces.py` writes four paper-table inputs:
 
 - `m5_runtime_eval.csv`: grouped by experiment and variant, with mean/std/CI95.
 - `m5_db_bench_eval.csv`: grouped by experiment, variant, and benchmark, with mean/std/CI95.
 - `m5_baseline_comparison.csv`: baseline-normalized comparison rows.
 - `m5_ablation_comparison.csv`: `full_faco` against each Exp-4 ablation.
+- `m5_high_frag_diagnostics.csv`: per-run final high-frag zones joined with
+  reorg victim traces.
+- `m5_high_frag_summary.csv`: experiment/variant rollup of high-frag coverage
+  diagnostics.
+- `m5_reorg_candidate_rows.csv`: candidate-level top-k reorg diagnostics.
+- `m5_reorg_candidate_summary.csv`: experiment/variant rollup of candidate
+  selection diagnostics.
 
 Do not use the raw `full_faco` aggregate across experiments for paper tables;
 it mixes different comparison questions.
@@ -94,6 +101,22 @@ bash -n experiments/M5/run_exp4.sh
 bash -n experiments/M5/run_all.sh
 python3 experiments/M5/summarize_traces.py experiments/M3/results/<run> /tmp/m5_summary.md
 ```
+
+For the current M5 evaluation flow, prefer the bundled validator:
+
+```bash
+bash experiments/M5/validate_eval_flow.sh offline \
+  experiments/M5/results/20260510-060423-run-all \
+  /tmp/faco_m5_eval_flow_check
+```
+
+It verifies shell syntax, regenerates an offline summary, and checks that:
+
+- `native` runtime FACO-local metrics stay `not_comparable`.
+- `cfsm_only` is used for fragmentation baseline comparisons.
+- `without_lacr` ablation rows are present and not averaged away.
+- `full_faco` rows keep their experiment identity.
+- high-frag diagnostic artifacts are present for the Exp-4 FACO variants.
 
 ## Device Protocol
 
@@ -141,6 +164,86 @@ not required for FACO trace analysis.
 3. `run_exp3.sh`: LACR movement breakdown through the M4 compare wrapper.
 4. `run_exp4.sh`: FACO-internal ablation matrix.
 5. `summarize_traces.py`: final CSV and Markdown summaries.
+
+After a device run, validate the generated result directory:
+
+```bash
+RESULT=experiments/M5/results/<new-run-all-dir>
+bash experiments/M5/validate_eval_flow.sh check-result "${RESULT}"
+bash experiments/M5/validate_eval_flow.sh check-dev-gates "${RESULT}"
+```
+
+`check-result` only verifies artifact structure and comparison protocol.
+`check-dev-gates` is the stricter pre-paper gate: `full_faco` must improve
+Exp-4 reset and high-frag metrics versus `cfsm_only`, keep WA below `1.01`,
+reach at least two candidate evaluations per run, accept at least two reorg
+plans per run, keep high-frag selected/accepted percentages near 100%, and
+raise final high-frag coverage above the configured threshold. Override gate
+thresholds with `M5_GATE_MIN_EVALS`, `M5_GATE_MIN_WA_MAX`,
+`M5_GATE_MIN_FINAL_COVERAGE_PCT`, `M5_GATE_MIN_HIGH_FRAG_SELECTED_PCT`, and
+`M5_GATE_MIN_HIGH_FRAG_ACCEPTED_PCT`.
+
+Print, but do not run, the next device commands with:
+
+```bash
+bash experiments/M5/validate_eval_flow.sh print-dev-command
+bash experiments/M5/validate_eval_flow.sh print-paper-command
+```
+
+Before changing reorg policy, inspect high-frag diagnostics:
+
+```bash
+RESULT=experiments/M5/results/<new-run-all-dir>
+column -s, -t "${RESULT}/m5_high_frag_summary.csv" | less -S
+column -s, -t "${RESULT}/m5_reorg_candidate_summary.csv" | less -S
+grep '^exp4,full_faco' "${RESULT}/m5_high_frag_diagnostics.csv"
+grep '^exp4,without_lacr' "${RESULT}/m5_high_frag_diagnostics.csv"
+grep '^exp4,full_faco' "${RESULT}/m5_reorg_candidate_rows.csv" | head -40
+```
+
+If `accepted_reorg_samples` is zero or
+`accepted_final_high_frag_coverage_pct` is low while `high_frag_zone_count` is
+high, use `faco_reorg_candidates.csv` and `m5_reorg_candidate_rows.csv` to check
+which top-k candidates were filtered, selected, penalized by LACR, or accepted.
+Fix candidate selection or LACR gating before running paper experiments.
+
+When dev workloads are too short to trigger stable reorg cadence, set
+`FACO_GC_INTERVAL_US` explicitly. The default ZenFS GC worker interval remains
+10 seconds; M5 diagnosis commonly uses 5 seconds first, then 3 seconds if the
+candidate evaluation count is still unstable:
+
+```bash
+CONFIRM_DEVICE_BENCH=1 \
+ZBD=nvme0n1 \
+M5_PROFILE=dev \
+M5_RUNS=3 \
+FACO_GC_INTERVAL_US=5000000 \
+M5_EXP4_BENCHMARKS=fillrandom,overwrite,overwrite,overwrite \
+bash experiments/M5/run_exp4.sh
+```
+
+If 5s keeps write amplification and throughput stable but misses final
+high-frag coverage, test a bounded backlog trigger rather than shortening the
+whole GC interval:
+
+```bash
+CONFIRM_DEVICE_BENCH=1 \
+ZBD=nvme0n1 \
+M5_PROFILE=dev \
+M5_RUNS=3 \
+FACO_GC_INTERVAL_US=5000000 \
+FACO_HIGH_FRAG_BACKLOG_TRIGGER=20 \
+FACO_REORG_EXTRA_PER_GC=1 \
+FACO_REORG_MAX_EXTRA_VALID_MB=64 \
+M5_EXP4_BENCHMARKS=fillrandom,overwrite,overwrite,overwrite \
+bash experiments/M5/run_exp4.sh
+```
+
+`FACO_HIGH_FRAG_BACKLOG_TRIGGER` enables the extra pass only when the current
+CFSM high-frag backlog is at or above the threshold. `FACO_REORG_EXTRA_PER_GC`
+caps extra accepted plans per GC wakeup, and `FACO_REORG_MAX_EXTRA_VALID_MB`
+caps the added estimated live-data migration. Leave these unset for the
+alpha-frozen baseline behavior.
 
 ## Ablation Matrix
 

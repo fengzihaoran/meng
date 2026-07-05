@@ -108,6 +108,9 @@ class FragmentationStateTable {
   /** Returns a stable copy of one zone's current state. */
   ZoneFragState Snapshot(uint64_t zone_id) const;
 
+  /** Counts active zones currently classified as high-fragmentation. */
+  size_t CountHighFragZones() const;
+
   /** Produces a compact human-readable dump for manual sanity checks. */
   std::string DebugString() const;
 

@@ -83,6 +83,28 @@ uint64_t ReadFacoEnvPercent(const char* name, uint64_t default_value) {
   return std::min<uint64_t>(100, static_cast<uint64_t>(parsed));
 }
 
+uint64_t ReadFacoEnvUint64Clamped(const char* name, uint64_t default_value,
+                                  uint64_t min_value, uint64_t max_value) {
+  const char* value = getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return default_value;
+  }
+  char* end = nullptr;
+  const unsigned long long parsed = strtoull(value, &end, 10);
+  if (end == value) {
+    return default_value;
+  }
+  return std::min<uint64_t>(
+      max_value, std::max<uint64_t>(min_value, static_cast<uint64_t>(parsed)));
+}
+
+uint64_t ReadFacoEnvMbAsBytesClamped(const char* name, uint64_t default_mb,
+                                     uint64_t max_mb) {
+  constexpr uint64_t kMiB = 1024ULL * 1024ULL;
+  const uint64_t mb = ReadFacoEnvUint64Clamped(name, default_mb, 0, max_mb);
+  return mb * kMiB;
+}
+
 }  // namespace
 
 Status Superblock::DecodeFrom(Slice* input) {
@@ -420,6 +442,8 @@ void ZenFS::DumpFragmentationState() {
   const std::string budget_trace_path = aux_path + "/faco_budget_trace.csv";
   const std::string reorg_summary_path = aux_path + "/faco_reorg_summary.txt";
   const std::string reorg_trace_path = aux_path + "/faco_reorg_trace.csv";
+  const std::string reorg_candidate_path =
+      aux_path + "/faco_reorg_candidates.csv";
   const std::string lacr_trace_path = aux_path + "/faco_lacr_trace.csv";
   const std::string runtime_metrics_path =
       aux_path + "/faco_runtime_metrics.txt";
@@ -498,6 +522,16 @@ void ZenFS::DumpFragmentationState() {
     } else {
       Warn(logger_, "FACO reorg: failed to write trace to %s",
            reorg_trace_path.c_str());
+    }
+
+    const std::string reorg_candidates =
+        reorg_planner_->ExportCandidateTraceCsv();
+    std::ofstream reorg_candidate_file(reorg_candidate_path);
+    if (reorg_candidate_file.good()) {
+      reorg_candidate_file << reorg_candidates;
+    } else {
+      Warn(logger_, "FACO reorg: failed to write candidate trace to %s",
+           reorg_candidate_path.c_str());
     }
   }
 
@@ -673,8 +707,11 @@ IOStatus ZenFS::ExecuteReorgPlan(const ReorgPlanner::Plan& plan) {
 }
 
 void ZenFS::GCWorker() {
+  const uint64_t gc_interval_us = ReadFacoEnvUint64Clamped(
+      "FACO_GC_INTERVAL_US", 10ULL * 1000ULL * 1000ULL,
+      100ULL * 1000ULL, 60ULL * 1000ULL * 1000ULL);
   while (run_gc_worker_.load(std::memory_order_acquire)) {
-    usleep(1000 * 1000 * 10);
+    usleep(gc_interval_us);
     if (!run_gc_worker_.load(std::memory_order_acquire)) {
       break;
     }
@@ -694,6 +731,14 @@ void ZenFS::GCWorker() {
     const uint64_t legacy_gc_start_level = GC_START_LEVEL;
     const uint64_t reorg_free_trigger_percent = ReadFacoEnvPercent(
         "FACO_REORG_FREE_SPACE_TRIGGER_PERCENT", /*default_value=*/100);
+    const uint64_t high_frag_backlog_trigger = ReadFacoEnvUint64Clamped(
+        "FACO_HIGH_FRAG_BACKLOG_TRIGGER", /*default_value=*/0, 0,
+        1000000);
+    const uint64_t reorg_extra_per_gc = ReadFacoEnvUint64Clamped(
+        "FACO_REORG_EXTRA_PER_GC", /*default_value=*/0, 0, 16);
+    const uint64_t reorg_max_extra_valid_bytes =
+        ReadFacoEnvMbAsBytesClamped("FACO_REORG_MAX_EXTRA_VALID_MB",
+                                    /*default_mb=*/0, /*max_mb=*/1024);
     const bool force_reorg_eval =
         ReadFacoEnvBool("FACO_REORG_FORCE_EVAL", /*default_value=*/false);
     const bool legacy_low_free = free_percent <= legacy_gc_start_level;
@@ -703,6 +748,7 @@ void ZenFS::GCWorker() {
 
 #if FACO_ENABLE_REORG && FACO_ENABLE_CFSM
     if (reorg_planner_ != nullptr && should_eval_reorg) {
+      bool m3_plan_succeeded = false;
       if (!run_gc_worker_.load(std::memory_order_acquire)) {
         break;
       }
@@ -715,6 +761,51 @@ void ZenFS::GCWorker() {
         IOStatus s = reorg_planner_->Execute(*plan);
         if (!s.ok()) {
           Error(logger_, "FACO reorg failed: %s", s.ToString().c_str());
+        } else {
+          m3_plan_succeeded = true;
+        }
+      }
+
+      if (m3_plan_succeeded && high_frag_backlog_trigger > 0 &&
+          reorg_extra_per_gc > 0 && frag_table != nullptr &&
+          frag_table->CountHighFragZones() >= high_frag_backlog_trigger) {
+        uint64_t extra_plans = 0;
+        uint64_t extra_valid_bytes = 0;
+        while (extra_plans < reorg_extra_per_gc &&
+               run_gc_worker_.load(std::memory_order_acquire) &&
+               frag_table->CountHighFragZones() >= high_frag_backlog_trigger) {
+          std::optional<ReorgPlanner::Plan> extra_plan =
+              reorg_planner_->NextPlan();
+          if (!extra_plan.has_value()) {
+            break;
+          }
+          if (reorg_max_extra_valid_bytes > 0 &&
+              extra_valid_bytes + extra_plan->estimated_valid_bytes >
+                  reorg_max_extra_valid_bytes) {
+            Info(logger_,
+                 "FACO reorg backlog: extra plan for zone %lu skipped by "
+                 "valid-byte budget (%lu + %lu > %lu)",
+                 extra_plan->victim_zone, extra_valid_bytes,
+                 extra_plan->estimated_valid_bytes,
+                 reorg_max_extra_valid_bytes);
+            break;
+          }
+
+          IOStatus s = reorg_planner_->Execute(*extra_plan);
+          if (!s.ok()) {
+            Error(logger_, "FACO reorg backlog failed: %s",
+                  s.ToString().c_str());
+            break;
+          }
+          extra_plans++;
+          extra_valid_bytes += extra_plan->estimated_valid_bytes;
+        }
+        if (extra_plans > 0) {
+          Info(logger_,
+               "FACO reorg backlog: executed %lu extra plans, estimated valid "
+               "bytes %lu, remaining high-frag zones %lu",
+               extra_plans, extra_valid_bytes,
+               static_cast<uint64_t>(frag_table->CountHighFragZones()));
         }
       }
     }

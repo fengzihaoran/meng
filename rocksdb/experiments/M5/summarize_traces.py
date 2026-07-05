@@ -117,6 +117,14 @@ def numeric_values(rows: list[dict[str, str]], key: str, scale: float = 1.0) -> 
     return values
 
 
+def join_limited(values: list[str], limit: int = 32) -> str:
+    if not values:
+        return ""
+    trimmed = values[:limit]
+    suffix = "" if len(values) <= limit else f";+{len(values) - limit}_more"
+    return ";".join(trimmed) + suffix
+
+
 def parse_kv_lines(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
@@ -181,6 +189,7 @@ def find_run_dirs(root: Path) -> list[Path]:
         "faco_runtime_metrics.txt",
         "faco_cfsm_summary.txt",
         "faco_reorg_trace.csv",
+        "faco_reorg_candidates.csv",
         "faco_lacr_trace.csv",
         "faco_metrics.txt",
         "db_bench.log",
@@ -262,6 +271,63 @@ def summarize_reorg_trace(rows: list[dict[str, str]]) -> dict[str, str]:
     }
 
 
+def summarize_reorg_candidate_trace(rows: list[dict[str, str]]) -> dict[str, str]:
+    if not rows:
+        return {
+            "reorg_candidate_rows": "0",
+            "reorg_candidate_evals": "0",
+            "reorg_candidate_high_frag_rows": "0",
+            "reorg_candidate_selected_rows": "0",
+            "reorg_candidate_accepted_rows": "0",
+            "reorg_candidate_high_frag_selected_rows": "0",
+            "reorg_candidate_high_frag_accepted_rows": "0",
+        }
+    eval_ids = {row.get("eval_id", "") for row in rows if row.get("eval_id")}
+    high_frag = [row for row in rows if is_high_frag_zone(row)]
+    selected = [row for row in rows if to_float(row.get("selected")) > 0]
+    accepted = [row for row in rows if to_float(row.get("accepted")) > 0]
+    high_selected = [row for row in selected if is_high_frag_zone(row)]
+    high_accepted = [row for row in accepted if is_high_frag_zone(row)]
+    lacr_penalized = [
+        row
+        for row in rows
+        if to_float(row.get("lacr_waste_penalty"))
+        + to_float(row.get("lacr_latency_penalty"))
+        > 0
+    ]
+    selected_ranks = [to_float(row.get("candidate_rank")) for row in selected]
+    accepted_ranks = [to_float(row.get("candidate_rank")) for row in accepted]
+    return {
+        "reorg_candidate_rows": str(len(rows)),
+        "reorg_candidate_evals": str(len(eval_ids)),
+        "reorg_candidate_high_frag_rows": str(len(high_frag)),
+        "reorg_candidate_selected_rows": str(len(selected)),
+        "reorg_candidate_accepted_rows": str(len(accepted)),
+        "reorg_candidate_high_frag_selected_rows": str(len(high_selected)),
+        "reorg_candidate_high_frag_accepted_rows": str(len(high_accepted)),
+        "reorg_candidate_high_frag_candidate_pct": (
+            f"{len(high_frag) / len(rows) * 100.0:.3f}" if rows else "NA"
+        ),
+        "reorg_candidate_high_frag_selected_pct": (
+            f"{len(high_selected) / len(selected) * 100.0:.3f}"
+            if selected
+            else "NA"
+        ),
+        "reorg_candidate_high_frag_accepted_pct": (
+            f"{len(high_accepted) / len(accepted) * 100.0:.3f}"
+            if accepted
+            else "NA"
+        ),
+        "reorg_candidate_selected_rank_mean": (
+            f"{mean(selected_ranks):.3f}" if selected_ranks else "NA"
+        ),
+        "reorg_candidate_accepted_rank_mean": (
+            f"{mean(accepted_ranks):.3f}" if accepted_ranks else "NA"
+        ),
+        "reorg_candidate_lacr_penalized_rows": str(len(lacr_penalized)),
+    }
+
+
 def collect_run_rows(root: Path) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for run_dir in find_run_dirs(root):
@@ -272,6 +338,9 @@ def collect_run_rows(root: Path) -> list[dict[str, str]]:
         lacr_debug = parse_brace_debug(run_dir / "faco_lacr_summary.txt", "FacoLacrState")
         metrics = parse_faco_metrics(run_dir / "faco_metrics.txt")
         reorg_trace = summarize_reorg_trace(read_csv(run_dir / "faco_reorg_trace.csv"))
+        reorg_candidates = summarize_reorg_candidate_trace(
+            read_csv(run_dir / "faco_reorg_candidates.csv")
+        )
         lacr_trace = summarize_lacr_trace(read_csv(run_dir / "faco_lacr_trace.csv"))
 
         total_bytes = to_float(runtime.get("bytes_written"))
@@ -318,8 +387,179 @@ def collect_run_rows(root: Path) -> list[dict[str, str]]:
             "lifetime_prediction_error_pct": metrics.get("faco.lacr.lifetime_prediction_error_pct", "NA"),
         }
         row.update(reorg_trace)
+        row.update(reorg_candidates)
         row.update(lacr_trace)
         rows.append(row)
+    return rows
+
+
+def is_high_frag_zone(row: dict[str, str]) -> bool:
+    fragment_class = int(to_float(row.get("fragment_class"), -1.0))
+    return fragment_class in (1, 3)
+
+
+def sorted_zone_ids(rows: list[dict[str, str]]) -> list[str]:
+    return [
+        str(int(to_float(row.get("zone_id"))))
+        for row in sorted(rows, key=lambda r: int(to_float(r.get("zone_id"))))
+    ]
+
+
+def collect_high_frag_diagnostic_rows(root: Path) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for run_dir in find_run_dirs(root):
+        experiment, variant, run = run_identity(run_dir, root)
+        zones_path = run_dir / "faco_cfsm_zones.csv"
+        reorg_path = run_dir / "faco_reorg_trace.csv"
+        zone_rows = read_csv(zones_path)
+        reorg_rows = read_csv(reorg_path)
+
+        if not zones_path.exists() or not zone_rows:
+            rows.append(
+                {
+                    "experiment": experiment,
+                    "variant": variant,
+                    "run": run,
+                    "run_dir": str(run_dir),
+                    "cfsm_zones_present": "0",
+                    "high_frag_zone_count": "NA",
+                    "active_zone_count": "NA",
+                    "high_frag_zones": "NA",
+                    "accepted_reorg_samples": str(
+                        len([r for r in reorg_rows if to_float(r.get("accepted")) > 0])
+                    ),
+                    "reorg_trace_samples": str(len(reorg_rows)),
+                    "accepted_high_frag_final_hits": "NA",
+                    "accepted_final_high_frag_coverage_pct": "NA",
+                    "missed_final_high_frag_count": "NA",
+                    "diagnosis": "no_cfsm_zone_export",
+                }
+            )
+            continue
+
+        active_rows = [row for row in zone_rows if to_float(row.get("valid_bytes")) > 0]
+        high_rows = [row for row in active_rows if is_high_frag_zone(row)]
+        high_zone_ids = sorted_zone_ids(high_rows)
+        high_zone_set = set(high_zone_ids)
+
+        reorg_victim_zones = [
+            str(int(to_float(row.get("victim_zone"))))
+            for row in reorg_rows
+            if row.get("victim_zone") not in (None, "")
+        ]
+        accepted_rows = [
+            row for row in reorg_rows if to_float(row.get("accepted")) > 0
+        ]
+        accepted_zone_ids = sorted(
+            {
+                str(int(to_float(row.get("victim_zone"))))
+                for row in accepted_rows
+                if row.get("victim_zone") not in (None, "")
+            },
+            key=lambda value: int(value),
+        )
+        evaluated_zone_ids = sorted(
+            set(reorg_victim_zones), key=lambda value: int(value)
+        )
+        accepted_high_hits = sorted(
+            high_zone_set.intersection(accepted_zone_ids),
+            key=lambda value: int(value),
+        )
+        evaluated_high_hits = sorted(
+            high_zone_set.intersection(evaluated_zone_ids),
+            key=lambda value: int(value),
+        )
+        missed_high = sorted(
+            high_zone_set.difference(accepted_zone_ids),
+            key=lambda value: int(value),
+        )
+
+        high_count = len(high_rows)
+        accepted_hit_count = len(accepted_high_hits)
+        accepted_coverage = (
+            accepted_hit_count / high_count * 100.0 if high_count > 0 else None
+        )
+        high_valid_bytes = sum(to_float(row.get("valid_bytes")) for row in high_rows)
+        high_invalid_bytes = sum(
+            to_float(row.get("invalid_bytes")) for row in high_rows
+        )
+        high_invalid_ratios = [
+            1.0 - to_float(row.get("valid_ratio")) for row in high_rows
+        ]
+        high_rbd = [to_float(row.get("rbd")) for row in high_rows]
+        top_rbd_zone_ids = [
+            str(int(to_float(row.get("zone_id"))))
+            for row in sorted(
+                active_rows,
+                key=lambda r: (
+                    -to_float(r.get("rbd")),
+                    int(to_float(r.get("zone_id"))),
+                ),
+            )[:16]
+        ]
+
+        diagnosis = "ok"
+        if high_count > 0 and not reorg_rows:
+            diagnosis = "high_frag_present_without_reorg_trace"
+        elif high_count > 0 and not accepted_rows:
+            diagnosis = "high_frag_present_without_accepted_reorg"
+        elif high_count > 0 and accepted_hit_count == 0:
+            diagnosis = "accepted_reorg_missed_final_high_frag"
+        elif high_count > 0 and len(missed_high) > 0:
+            diagnosis = "accepted_reorg_partially_covered_final_high_frag"
+
+        rows.append(
+            {
+                "experiment": experiment,
+                "variant": variant,
+                "run": run,
+                "run_dir": str(run_dir),
+                "cfsm_zones_present": "1",
+                "active_zone_count": str(len(active_rows)),
+                "high_frag_zone_count": str(high_count),
+                "high_frag_zones": join_limited(high_zone_ids),
+                "high_frag_valid_bytes": f"{high_valid_bytes:.0f}",
+                "high_frag_invalid_bytes": f"{high_invalid_bytes:.0f}",
+                "high_frag_invalid_ratio_mean": (
+                    f"{mean(high_invalid_ratios):.6f}" if high_invalid_ratios else "NA"
+                ),
+                "high_frag_rbd_mean": f"{mean(high_rbd):.6f}" if high_rbd else "NA",
+                "top_rbd_zones": join_limited(top_rbd_zone_ids),
+                "reorg_trace_samples": str(len(reorg_rows)),
+                "reorg_evaluated_unique_zones": str(len(evaluated_zone_ids)),
+                "reorg_evaluated_zones": join_limited(evaluated_zone_ids),
+                "accepted_reorg_samples": str(len(accepted_rows)),
+                "accepted_reorg_unique_zones": str(len(accepted_zone_ids)),
+                "accepted_reorg_zones": join_limited(accepted_zone_ids),
+                "evaluated_high_frag_final_hits": str(len(evaluated_high_hits)),
+                "evaluated_high_frag_final_zones": join_limited(evaluated_high_hits),
+                "accepted_high_frag_final_hits": str(accepted_hit_count),
+                "accepted_high_frag_final_zones": join_limited(accepted_high_hits),
+                "accepted_final_high_frag_coverage_pct": (
+                    f"{accepted_coverage:.3f}" if accepted_coverage is not None else "NA"
+                ),
+                "missed_final_high_frag_count": str(len(missed_high)),
+                "missed_final_high_frag_zones": join_limited(missed_high),
+                "diagnosis": diagnosis,
+            }
+        )
+    return rows
+
+
+def collect_reorg_candidate_rows(root: Path) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for path in sorted(root.rglob("faco_reorg_candidates.csv")):
+        run_dir = path.parent
+        experiment, variant, run = run_identity(run_dir, root)
+        for row in read_csv(path):
+            out = {
+                "experiment": experiment,
+                "variant": variant,
+                "run": run,
+                "run_dir": str(run_dir),
+            }
+            out.update(row)
+            rows.append(out)
     return rows
 
 
@@ -380,6 +620,159 @@ def grouped_runtime_eval_rows(rows: list[dict[str, str]]) -> list[dict[str, str]
             "total_movement_bytes_proxy",
             scale=1024 ** 2,
         )
+        out.append(row)
+    return out
+
+
+def grouped_high_frag_summary_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    grouped: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        grouped[(row.get("experiment", "."), row.get("variant", ""))].append(row)
+
+    out: list[dict[str, str]] = []
+    for (experiment, variant), group in sorted(grouped.items()):
+        row = {
+            "experiment": experiment,
+            "variant": variant,
+            "runs": str(len(group)),
+        }
+        add_metric_stats(row, group, "high_frag_zones", "high_frag_zone_count")
+        add_metric_stats(row, group, "active_zones", "active_zone_count")
+        add_metric_stats(
+            row,
+            group,
+            "accepted_reorg_samples",
+            "accepted_reorg_samples",
+        )
+        add_metric_stats(
+            row,
+            group,
+            "accepted_high_frag_hits",
+            "accepted_high_frag_final_hits",
+        )
+        add_metric_stats(
+            row,
+            group,
+            "accepted_final_high_frag_coverage_pct",
+            "accepted_final_high_frag_coverage_pct",
+        )
+        add_metric_stats(
+            row,
+            group,
+            "missed_final_high_frag",
+            "missed_final_high_frag_count",
+        )
+        diagnoses = sorted(
+            {
+                diag
+                for diag in (item.get("diagnosis", "") for item in group)
+                if diag
+            }
+        )
+        row["diagnoses"] = ";".join(diagnoses)
+        out.append(row)
+    return out
+
+
+def grouped_reorg_candidate_summary_rows(
+    rows: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    grouped: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        grouped[(row.get("experiment", "."), row.get("variant", ""))].append(row)
+
+    out: list[dict[str, str]] = []
+    for (experiment, variant), group in sorted(grouped.items()):
+        row = {
+            "experiment": experiment,
+            "variant": variant,
+            "runs": str(len(group)),
+        }
+        add_metric_stats(row, group, "candidate_rows", "reorg_candidate_rows")
+        add_metric_stats(row, group, "candidate_evals", "reorg_candidate_evals")
+        add_metric_stats(
+            row,
+            group,
+            "high_frag_candidate_rows",
+            "reorg_candidate_high_frag_rows",
+        )
+        add_metric_stats(
+            row,
+            group,
+            "selected_rows",
+            "reorg_candidate_selected_rows",
+        )
+        add_metric_stats(
+            row,
+            group,
+            "accepted_rows",
+            "reorg_candidate_accepted_rows",
+        )
+        add_metric_stats(
+            row,
+            group,
+            "high_frag_selected_rows",
+            "reorg_candidate_high_frag_selected_rows",
+        )
+        add_metric_stats(
+            row,
+            group,
+            "high_frag_accepted_rows",
+            "reorg_candidate_high_frag_accepted_rows",
+        )
+        add_metric_stats(
+            row,
+            group,
+            "high_frag_candidate_pct",
+            "reorg_candidate_high_frag_candidate_pct",
+        )
+        add_metric_stats(
+            row,
+            group,
+            "high_frag_selected_pct",
+            "reorg_candidate_high_frag_selected_pct",
+        )
+        add_metric_stats(
+            row,
+            group,
+            "high_frag_accepted_pct",
+            "reorg_candidate_high_frag_accepted_pct",
+        )
+        add_metric_stats(
+            row,
+            group,
+            "selected_rank",
+            "reorg_candidate_selected_rank_mean",
+        )
+        add_metric_stats(
+            row,
+            group,
+            "lacr_penalized_rows",
+            "reorg_candidate_lacr_penalized_rows",
+        )
+
+        diagnoses: set[str] = set()
+        for item in group:
+            candidate_rows = to_float(item.get("reorg_candidate_rows"))
+            high_candidates = to_float(item.get("reorg_candidate_high_frag_rows"))
+            high_selected = to_float(
+                item.get("reorg_candidate_high_frag_selected_rows")
+            )
+            high_accepted = to_float(
+                item.get("reorg_candidate_high_frag_accepted_rows")
+            )
+            lacr_penalized = to_float(
+                item.get("reorg_candidate_lacr_penalized_rows")
+            )
+            if candidate_rows == 0:
+                diagnoses.add("no_candidate_trace")
+            if high_candidates > 0 and high_selected == 0:
+                diagnoses.add("selected_missed_eval_high_frag")
+            if high_candidates > 0 and high_accepted == 0:
+                diagnoses.add("accepted_missed_eval_high_frag")
+            if lacr_penalized > 0:
+                diagnoses.add("lacr_penalties_present")
+        row["diagnoses"] = ";".join(sorted(diagnoses)) if diagnoses else "ok"
         out.append(row)
     return out
 
@@ -778,6 +1171,7 @@ def write_markdown(
     out_md: Path,
     run_rows: list[dict[str, str]],
     bench_rows: list[dict[str, str]],
+    high_frag_diag_rows: list[dict[str, str]],
 ) -> None:
     missing_l2 = [
         row for row in run_rows
@@ -786,6 +1180,8 @@ def write_markdown(
     ]
     runtime_eval_rows = grouped_runtime_eval_rows(run_rows)
     bench_eval_rows = grouped_db_bench_eval_rows(bench_rows)
+    high_frag_summary_rows = grouped_high_frag_summary_rows(high_frag_diag_rows)
+    reorg_candidate_summary_rows = grouped_reorg_candidate_summary_rows(run_rows)
     baseline_comparison_rows = grouped_baseline_comparison_rows(
         runtime_eval_rows, bench_eval_rows
     )
@@ -852,6 +1248,83 @@ def write_markdown(
             for row in runtime_eval_rows
         ],
     )
+
+    lines += [
+        "",
+        "## High-Frag Diagnostics",
+        "",
+        "Diagnostics join final CFSM zone classes with reorg trace victims. Coverage is measured against final high-frag zones, so a cleaned victim may no longer appear as covered here.",
+        "",
+    ]
+    lines += markdown_table(
+        [
+            "experiment",
+            "variant",
+            "runs",
+            "high-frag mean",
+            "accepted reorg mean",
+            "accepted high-frag hits mean",
+            "coverage % mean",
+            "missed high-frag mean",
+            "diagnoses",
+        ],
+        [
+            [
+                row.get("experiment", ""),
+                row.get("variant", ""),
+                row.get("runs", ""),
+                row.get("high_frag_zones_mean", ""),
+                row.get("accepted_reorg_samples_mean", ""),
+                row.get("accepted_high_frag_hits_mean", ""),
+                row.get("accepted_final_high_frag_coverage_pct_mean", ""),
+                row.get("missed_final_high_frag_mean", ""),
+                row.get("diagnoses", ""),
+            ]
+            for row in high_frag_summary_rows
+        ],
+    )
+
+    if reorg_candidate_summary_rows:
+        lines += [
+            "",
+            "## Reorg Candidate Diagnostics",
+            "",
+            "Candidate diagnostics are measured at evaluation time from the top-k victim list, not from the final shutdown CFSM snapshot.",
+            "",
+        ]
+        lines += markdown_table(
+            [
+                "experiment",
+                "variant",
+                "runs",
+                "evals mean",
+                "high-frag candidates mean",
+                "selected mean",
+                "high-frag selected %",
+                "accepted mean",
+                "high-frag accepted %",
+                "selected rank mean",
+                "LACR penalized rows mean",
+                "diagnoses",
+            ],
+            [
+                [
+                    row.get("experiment", ""),
+                    row.get("variant", ""),
+                    row.get("runs", ""),
+                    row.get("candidate_evals_mean", ""),
+                    row.get("high_frag_candidate_rows_mean", ""),
+                    row.get("selected_rows_mean", ""),
+                    row.get("high_frag_selected_pct_mean", ""),
+                    row.get("accepted_rows_mean", ""),
+                    row.get("high_frag_accepted_pct_mean", ""),
+                    row.get("selected_rank_mean", ""),
+                    row.get("lacr_penalized_rows_mean", ""),
+                    row.get("diagnoses", ""),
+                ]
+                for row in reorg_candidate_summary_rows
+            ],
+        )
 
     if bench_eval_rows:
         lines += [
@@ -960,6 +1433,7 @@ def write_markdown(
         "- You can compare `full_faco` with `native` only for db_bench performance metrics in this protocol.",
         "- You can compare reset/high-frag pressure against `cfsm_only`, because it preserves FACO-local observability.",
         "- You can not claim native has zero high-frag zones; those counters are missing, so they stay `NA`.",
+        "- Use `m5_high_frag_diagnostics.csv` before changing planner policy; it identifies whether reorg victims covered final high-frag zones.",
         claim_line(
             find_comparison(
                 baseline_comparison_rows,
@@ -1004,7 +1478,7 @@ def write_markdown(
         "",
         "- `total_movement_bytes_proxy` is `reorg migrated bytes + LACR trace output bytes`; it is a protocol proxy until RocksDB compaction byte counters are joined from db_bench statistics.",
         "- `reorg_duplicate_movement_bytes_proxy` counts accepted reorg estimated-valid bytes when the reorg trace also marks the zone as compaction-touched.",
-        "- `m5_runtime_eval.csv`, `m5_db_bench_eval.csv`, `m5_baseline_comparison.csv`, and `m5_ablation_comparison.csv` are the paper table inputs. The older raw CSV files are run-level evidence, not final table material.",
+        "- `m5_runtime_eval.csv`, `m5_db_bench_eval.csv`, `m5_baseline_comparison.csv`, and `m5_ablation_comparison.csv` are the paper table inputs. `m5_high_frag_diagnostics.csv` and `m5_high_frag_summary.csv` are diagnosis inputs for planner changes.",
         "- `NA` for natural aging or lifetime prediction means the current alpha-frozen M4 artifacts do not expose LACR L2 data. Do not pretend those KPI are measured.",
         "",
     ]
@@ -1021,6 +1495,12 @@ def write_protocol_json(out_md: Path, run_rows: list[dict[str, str]]) -> None:
             "m5_db_bench_eval.csv",
             "m5_baseline_comparison.csv",
             "m5_ablation_comparison.csv",
+        ],
+        "diagnostic_tables": [
+            "m5_high_frag_diagnostics.csv",
+            "m5_high_frag_summary.csv",
+            "m5_reorg_candidate_rows.csv",
+            "m5_reorg_candidate_summary.csv",
         ],
         "comparison_protocol": {
             "native": "performance baseline only",
@@ -1042,6 +1522,7 @@ def write_protocol_json(out_md: Path, run_rows: list[dict[str, str]]) -> None:
             "faco_cfsm_zones.csv",
             "faco_budget_trace.csv",
             "faco_reorg_trace.csv",
+            "faco_reorg_candidates.csv",
             "faco_lacr_trace.csv",
             "faco_runtime_metrics.txt",
             "faco_metrics.txt",
@@ -1069,8 +1550,12 @@ def main() -> int:
 
     run_rows = collect_run_rows(root)
     bench_rows = collect_db_bench_rows(root)
+    high_frag_diag_rows = collect_high_frag_diagnostic_rows(root)
+    reorg_candidate_rows = collect_reorg_candidate_rows(root)
     runtime_eval_rows = grouped_runtime_eval_rows(run_rows)
     db_bench_eval_rows = grouped_db_bench_eval_rows(bench_rows)
+    high_frag_summary_rows = grouped_high_frag_summary_rows(high_frag_diag_rows)
+    reorg_candidate_summary_rows = grouped_reorg_candidate_summary_rows(run_rows)
     baseline_comparison_rows = grouped_baseline_comparison_rows(
         runtime_eval_rows, db_bench_eval_rows
     )
@@ -1080,16 +1565,27 @@ def main() -> int:
 
     write_csv(out_md.with_name("m5_run_artifacts.csv"), run_rows)
     write_csv(out_md.with_name("m5_db_bench_rows.csv"), bench_rows)
+    write_csv(out_md.with_name("m5_high_frag_diagnostics.csv"), high_frag_diag_rows)
+    write_csv(out_md.with_name("m5_high_frag_summary.csv"), high_frag_summary_rows)
+    write_csv(out_md.with_name("m5_reorg_candidate_rows.csv"), reorg_candidate_rows)
+    write_csv(
+        out_md.with_name("m5_reorg_candidate_summary.csv"),
+        reorg_candidate_summary_rows,
+    )
     write_csv(out_md.with_name("m5_runtime_eval.csv"), runtime_eval_rows)
     write_csv(out_md.with_name("m5_db_bench_eval.csv"), db_bench_eval_rows)
     write_csv(out_md.with_name("m5_baseline_comparison.csv"), baseline_comparison_rows)
     write_csv(out_md.with_name("m5_ablation_comparison.csv"), ablation_comparison_rows)
-    write_markdown(root, out_md, run_rows, bench_rows)
+    write_markdown(root, out_md, run_rows, bench_rows, high_frag_diag_rows)
     write_protocol_json(out_md, run_rows)
 
     print(f"Wrote {out_md}")
     print(f"Wrote {out_md.with_name('m5_run_artifacts.csv')}")
     print(f"Wrote {out_md.with_name('m5_db_bench_rows.csv')}")
+    print(f"Wrote {out_md.with_name('m5_high_frag_diagnostics.csv')}")
+    print(f"Wrote {out_md.with_name('m5_high_frag_summary.csv')}")
+    print(f"Wrote {out_md.with_name('m5_reorg_candidate_rows.csv')}")
+    print(f"Wrote {out_md.with_name('m5_reorg_candidate_summary.csv')}")
     print(f"Wrote {out_md.with_name('m5_runtime_eval.csv')}")
     print(f"Wrote {out_md.with_name('m5_db_bench_eval.csv')}")
     print(f"Wrote {out_md.with_name('m5_baseline_comparison.csv')}")

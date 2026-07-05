@@ -27,6 +27,7 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 
 constexpr size_t kMaxTraceSamples = 4096;
+constexpr size_t kMaxCandidateTraceSamples = 16384;
 
 float ClampFloat(float value, float lo, float hi) {
   return std::max(lo, std::min(hi, value));
@@ -236,6 +237,7 @@ ReorgPlanner::ReorgPlanner(const Config& cfg, FragmentationStateTable* frag,
       last_adaptive_tau_(0.0f),
       last_execution_us_(0) {
   trace_.reserve(128);
+  candidate_trace_.reserve(1024);
   adaptive_net_history_.reserve(cfg_.adaptive_history_size);
 }
 
@@ -246,9 +248,11 @@ void ReorgPlanner::SetExecuteFn(ExecuteFn fn) {
 
 std::optional<ReorgPlanner::Plan> ReorgPlanner::NextPlan() {
 #if FACO_ENABLE_REORG && FACO_ENABLE_CFSM
+  uint64_t eval_id = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     eval_count_++;
+    eval_id = eval_count_;
   }
 
   if (frag_ == nullptr || zone_capacity_ == 0) {
@@ -274,13 +278,53 @@ std::optional<ReorgPlanner::Plan> ReorgPlanner::NextPlan() {
   uint64_t cooldown_skipped = 0;
   uint64_t tiny_skipped = 0;
   const uint64_t min_migrate_bytes = EffectiveMinMigrateBytes();
-  for (uint64_t zone_id : victims) {
+  std::vector<CandidateTraceSample> candidate_samples;
+  candidate_samples.reserve(victims.size());
+  for (size_t victim_index = 0; victim_index < victims.size();
+       ++victim_index) {
+    const uint64_t zone_id = victims[victim_index];
     const ZoneFragState state = frag_->Snapshot(zone_id);
     const uint64_t valid = std::min(state.valid_bytes, zone_capacity_);
-    const float net = ComputeNet(zone_id);
-    if (!std::isfinite(net)) continue;
+    const uint64_t invalid = zone_capacity_ > valid ? zone_capacity_ - valid : 0;
+    const float valid_ratio =
+        zone_capacity_ == 0
+            ? 0.0f
+            : static_cast<float>(valid) / static_cast<float>(zone_capacity_);
+    const float invalid_ratio = 1.0f - std::min(1.0f, valid_ratio);
+    const float net_m3 = ComputeM3Net(zone_id);
+    if (!std::isfinite(net_m3)) continue;
     const LacrAdjustment lacr_adjustment =
-        ComputeLacrAdjustment(zone_id, ComputeM3Net(zone_id));
+        ComputeLacrAdjustment(zone_id, net_m3);
+    const float net = lacr_adjustment.net_m4;
+    if (!std::isfinite(net)) continue;
+
+    CandidateTraceSample candidate_sample;
+    candidate_sample.eval_id = eval_id;
+    candidate_sample.now_us = now_us;
+    candidate_sample.candidate_rank = victim_index + 1;
+    candidate_sample.zone_id = zone_id;
+    candidate_sample.valid_bytes = valid;
+    candidate_sample.invalid_bytes = invalid;
+    candidate_sample.valid_ratio = valid_ratio;
+    candidate_sample.invalid_ratio = invalid_ratio;
+    candidate_sample.rbd = frag_->GetRBD(zone_id);
+    candidate_sample.zvdr_ema = state.zvdr_ema;
+    candidate_sample.fragment_class = static_cast<int>(state.fragment_class);
+    candidate_sample.lifetime_class = static_cast<int>(state.lifetime_class);
+    candidate_sample.min_migrate_bytes = min_migrate_bytes;
+    candidate_sample.current_budget = CurrentBudget();
+    candidate_sample.max_active_budget = MaxActiveBudget();
+    candidate_sample.lacr_enabled = lacr_adjustment.enabled;
+    candidate_sample.lacr_zone_score = lacr_adjustment.zone_score;
+    candidate_sample.lacr_synergy_bonus = lacr_adjustment.synergy_bonus;
+    candidate_sample.lacr_waste_penalty = lacr_adjustment.waste_penalty;
+    candidate_sample.lacr_latency_penalty = lacr_adjustment.latency_penalty;
+    candidate_sample.net_m3 = lacr_adjustment.net_m3;
+    candidate_sample.net_m4 = lacr_adjustment.net_m4;
+    candidate_sample.active_compaction_files =
+        lacr_adjustment.active_compaction_files;
+    candidate_sample.compaction_touched_zone =
+        lacr_adjustment.compaction_touched_zone;
 
     const Plan candidate{zone_id, net, valid};
     if (!observed || net > best_observed.net_benefit ||
@@ -293,6 +337,9 @@ std::optional<ReorgPlanner::Plan> ReorgPlanner::NextPlan() {
 
     if (min_migrate_bytes > 0 && valid < min_migrate_bytes) {
       tiny_skipped++;
+      candidate_sample.tiny_filtered = 1;
+      candidate_sample.reason = "filtered_tiny";
+      candidate_samples.push_back(candidate_sample);
       continue;
     }
 
@@ -310,14 +357,28 @@ std::optional<ReorgPlanner::Plan> ReorgPlanner::NextPlan() {
     }
     if (on_cooldown) {
       cooldown_skipped++;
+      candidate_sample.cooldown_filtered = 1;
+      candidate_sample.reason = "filtered_cooldown";
+      candidate_samples.push_back(candidate_sample);
       continue;
     }
 
+    candidate_sample.actionable = 1;
+    candidate_sample.reason = "not_selected";
     if (!found || net > best.net_benefit ||
         (net == best.net_benefit && zone_id < best.victim_zone)) {
       best = candidate;
       best_lacr = lacr_adjustment;
       found = true;
+    }
+    candidate_samples.push_back(candidate_sample);
+  }
+
+  if (observed) {
+    for (CandidateTraceSample& sample : candidate_samples) {
+      if (sample.zone_id == best_observed.victim_zone) {
+        sample.best_observed = 1;
+      }
     }
   }
 
@@ -353,6 +414,7 @@ std::optional<ReorgPlanner::Plan> ReorgPlanner::NextPlan() {
                       last_adaptive_q_, last_adaptive_tau_,
                       /*warmup=*/false, /*rate_limited=*/false,
                       best_observed_lacr);
+    RecordCandidateTraceLocked(candidate_samples);
     return std::nullopt;
   }
 
@@ -396,9 +458,18 @@ std::optional<ReorgPlanner::Plan> ReorgPlanner::NextPlan() {
     RecordAdaptiveNetLocked(best.net_benefit);
   }
 
+  for (CandidateTraceSample& sample : candidate_samples) {
+    if (sample.actionable > 0 && sample.zone_id == best.victim_zone) {
+      sample.selected = 1;
+      sample.accepted = accepted ? 1 : 0;
+      sample.reason = accept_reason;
+    }
+  }
+
   RecordTraceLocked(now_us, best, accepted, cooldown_skipped, tiny_skipped,
                     accept_reason, tau_trigger, adaptive_q, adaptive_tau,
                     warmup, rate_limited, best_lacr);
+  RecordCandidateTraceLocked(candidate_samples);
   if (!accepted) {
     rejected_plans_++;
     if (warmup) {
@@ -572,6 +643,38 @@ std::string ReorgPlanner::ExportTraceCsv() const {
           << sample.compaction_touched_zone;
     }
     oss << "\n";
+  }
+  return oss.str();
+}
+
+std::string ReorgPlanner::ExportCandidateTraceCsv() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::ostringstream oss;
+  oss << "eval_id,now_us,candidate_rank,zone_id,valid_bytes,invalid_bytes,"
+         "valid_ratio,invalid_ratio,rbd,zvdr_ema,fragment_class,"
+         "lifetime_class,min_migrate_bytes,tiny_filtered,cooldown_filtered,"
+         "actionable,best_observed,selected,accepted,reason,current_budget,"
+         "max_active_budget,lacr_enabled,lacr_zone_score,lacr_synergy_bonus,"
+         "lacr_waste_penalty,lacr_latency_penalty,net_m3,net_m4,"
+         "active_compaction_files,compaction_touched_zone\n";
+  oss << std::setprecision(9);
+  for (const CandidateTraceSample& sample : candidate_trace_) {
+    oss << sample.eval_id << "," << sample.now_us << ","
+        << sample.candidate_rank << "," << sample.zone_id << ","
+        << sample.valid_bytes << "," << sample.invalid_bytes << ","
+        << sample.valid_ratio << "," << sample.invalid_ratio << ","
+        << sample.rbd << "," << sample.zvdr_ema << ","
+        << sample.fragment_class << "," << sample.lifetime_class << ","
+        << sample.min_migrate_bytes << "," << sample.tiny_filtered << ","
+        << sample.cooldown_filtered << "," << sample.actionable << ","
+        << sample.best_observed << "," << sample.selected << ","
+        << sample.accepted << "," << sample.reason << ","
+        << sample.current_budget << "," << sample.max_active_budget << ","
+        << sample.lacr_enabled << "," << sample.lacr_zone_score << ","
+        << sample.lacr_synergy_bonus << "," << sample.lacr_waste_penalty << ","
+        << sample.lacr_latency_penalty << "," << sample.net_m3 << ","
+        << sample.net_m4 << "," << sample.active_compaction_files << ","
+        << sample.compaction_touched_zone << "\n";
   }
   return oss.str();
 }
@@ -789,6 +892,16 @@ void ReorgPlanner::RecordTraceLocked(uint64_t now_us, const Plan& plan,
   sample.active_compaction_files = lacr_adjustment.active_compaction_files;
   sample.compaction_touched_zone = lacr_adjustment.compaction_touched_zone;
   trace_.push_back(sample);
+}
+
+void ReorgPlanner::RecordCandidateTraceLocked(
+    const std::vector<CandidateTraceSample>& samples) {
+  for (const CandidateTraceSample& sample : samples) {
+    if (candidate_trace_.size() == kMaxCandidateTraceSamples) {
+      candidate_trace_.erase(candidate_trace_.begin());
+    }
+    candidate_trace_.push_back(sample);
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
