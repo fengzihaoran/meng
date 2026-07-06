@@ -746,12 +746,12 @@ int zenfs_tool_dump() {
     return 1;
   }
 //
-  IOStatus io_s = zbdRaw->LoadPECycles();
-  if (!io_s.ok()) {
-    fprintf(stderr, "Failed to load pe cycles, error: %s\n",
-            io_s.ToString().c_str());
-    return 1;
-  }
+  // IOStatus io_s = zbdRaw->LoadPECycles();
+  // if (!io_s.ok()) {
+  //   fprintf(stderr, "Failed to load pe cycles, error: %s\n",
+  //           io_s.ToString().c_str());
+  //   return 1;
+  // }
 //
   std::ostream &json_stream = std::cout;
   json_stream << "{\"zones\":";
