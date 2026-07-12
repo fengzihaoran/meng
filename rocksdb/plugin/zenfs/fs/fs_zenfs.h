@@ -15,6 +15,9 @@ namespace fs = std::filesystem;
 #endif
 
 #include <memory>
+#include <atomic>
+#include <mutex>
+#include <string>
 #include <thread>
 
 #include "io_zenfs.h"
@@ -148,6 +151,15 @@ class ZenFS : public FileSystemWrapper {
 
   std::unique_ptr<std::thread> gc_worker_ = nullptr;
   bool run_gc_worker_ = false;
+  std::unique_ptr<std::thread> fragsense_stats_worker_ = nullptr;
+  std::atomic<bool> run_fragsense_stats_worker_{false};
+  std::string fragsense_stats_path_;
+  std::string fragsense_observe_dir_;
+  uint64_t fragsense_stats_interval_ms_ = 1000;
+  uint64_t fragsense_sample_id_ = 0;
+  double fragsense_blocked_invalid_ratio_ = 0.20;
+  bool fragsense_observer_mode_ = false;
+  std::mutex fragsense_stats_dump_mtx_;
 
   struct ZenFSMetadataWriter : public MetadataWriter {
     ZenFS* zenFS;
@@ -170,6 +182,11 @@ class ZenFS : public FileSystemWrapper {
 
   void LogFiles();
   void ClearFiles();
+  void MaybeStartFragSenseStatsWorker();
+  void StopFragSenseStatsWorker();
+  void FragSenseStatsWorker();
+  void DumpZoneFragStats();
+  void WriteFragSenseObserverMetadata();
   std::string FormatPathLexically(fs::path filepath);
   IOStatus WriteSnapshotLocked(ZenMetaLog* meta_log);
   IOStatus WriteEndRecord(ZenMetaLog* meta_log);

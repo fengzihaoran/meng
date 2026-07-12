@@ -174,6 +174,7 @@ Status ZoneFile::DecodeFrom(Slice* input) {
           return Status::Corruption("ZoneFile", "Invalid zone extent");
         extent->zone_->used_capacity_ += extent->length_;
         extents_.push_back(extent);
+        zbd_->RecordExtentCreated(extent->zone_, extent->length_);
         break;
       case kModificationTime:
         uint64_t ct;
@@ -226,6 +227,7 @@ Status ZoneFile::MergeUpdate(std::shared_ptr<ZoneFile> update, bool replace) {
     Zone* zone = extent->zone_;
     zone->used_capacity_ += extent->length_;
     extents_.push_back(new ZoneExtent(extent->start_, extent->length_, zone));
+    zbd_->RecordExtentCreated(zone, extent->length_);
   }
   extent_start_ = update->GetExtentStart();
   is_sparse_ = update->IsSparse();
@@ -267,6 +269,7 @@ void ZoneFile::ClearExtents() {
 
     assert(zone && zone->used_capacity_ >= (*e)->length_);
     zone->used_capacity_ -= (*e)->length_;
+    zbd_->RecordExtentInvalidated(zone, (*e)->length_);
     delete *e;
   }
   extents_.clear();
@@ -472,6 +475,7 @@ void ZoneFile::PushExtent() {
   extents_.push_back(new ZoneExtent(extent_start_, length, active_zone_));
 
   active_zone_->used_capacity_ += length;
+  zbd_->RecordExtentCreated(active_zone_, length);
   extent_start_ = active_zone_->wp_;
   extent_filepos_ = file_size_;
 }
@@ -528,6 +532,7 @@ IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) {
 
     extent_start_ = active_zone_->wp_;
     active_zone_->used_capacity_ += extent_length;
+    zbd_->RecordExtentCreated(active_zone_, extent_length);
     file_size_ += extent_length;
     left -= extent_length;
 
@@ -586,6 +591,7 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
 
     extent_start_ = active_zone_->wp_;
     active_zone_->used_capacity_ += extent_length;
+    zbd_->RecordExtentCreated(active_zone_, extent_length);
     file_size_ += extent_length;
     left -= extent_length;
 
@@ -678,6 +684,7 @@ IOStatus ZoneFile::RecoverSparseExtents(uint64_t start, uint64_t end,
     zone->used_capacity_ += extent_length;
     extents_.push_back(new ZoneExtent(next_extent_start + SPARSE_HEADER_SIZE,
                                       extent_length, zone));
+    zbd_->RecordExtentCreated(zone, extent_length);
 
     uint64_t extent_blocks = (extent_length + SPARSE_HEADER_SIZE) / block_sz;
     if ((extent_length + SPARSE_HEADER_SIZE) % block_sz) {
@@ -726,6 +733,7 @@ IOStatus ZoneFile::Recover() {
        any missing data using the WP */
     zone->used_capacity_ += to_recover;
     extents_.push_back(new ZoneExtent(extent_start_, to_recover, zone));
+    zbd_->RecordExtentCreated(zone, to_recover);
   }
 
   /* Mark up the file as having no missing extents */

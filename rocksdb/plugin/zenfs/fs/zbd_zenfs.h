@@ -36,6 +36,15 @@ class ZonedBlockDeviceBackend;
 class ZoneSnapshot;
 class ZenFSSnapshotOptions;
 
+struct ZoneFragStats {
+  uint64_t zone_id = 0;
+  std::atomic<uint64_t> extent_count_total{0};
+  std::atomic<uint64_t> first_write_ms{0};
+  std::atomic<uint64_t> last_write_seq{0};
+  std::atomic<uint64_t> last_invalidate_seq{0};
+  std::atomic<uint64_t> reset_count{0};
+};
+
 class ZoneList {
  private:
   void *data_;
@@ -64,6 +73,7 @@ class Zone {
   uint64_t wp_;
   Env::WriteLifeTimeHint lifetime_;
   std::atomic<uint64_t> used_capacity_;
+  ZoneFragStats frag_stats_;
 
   IOStatus Reset();
   IOStatus Finish();
@@ -75,7 +85,7 @@ class Zone {
   bool IsEmpty();
   uint64_t GetZoneNr();
   uint64_t GetCapacityLeft();
-  bool IsBusy() { return this->busy_.load(std::memory_order_relaxed); }
+  bool IsBusy() const { return this->busy_.load(std::memory_order_relaxed); }
   bool Acquire() {
     bool expected = false;
     return this->busy_.compare_exchange_strong(expected, true,
@@ -149,6 +159,8 @@ class ZonedBlockDevice {
   uint32_t finish_threshold_ = 0;
   std::atomic<uint64_t> bytes_written_{0};
   std::atomic<uint64_t> gc_bytes_written_{0};
+  std::atomic<uint64_t> fragsense_seq_{0};
+  bool fragsense_stats_enabled_ = false;
 
   std::atomic<long> active_io_zones_;
   std::atomic<long> open_io_zones_;
@@ -214,6 +226,12 @@ class ZonedBlockDevice {
   std::shared_ptr<ZenFSMetrics> GetMetrics() { return metrics_; }
 
   void GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot);
+  bool FragSenseStatsEnabled() const { return fragsense_stats_enabled_; }
+  uint64_t GetFragSenseSeq() const { return fragsense_seq_.load(); }
+  void RecordZoneWrite(Zone *zone, uint64_t bytes);
+  void RecordZoneReset(Zone *zone);
+  void RecordExtentCreated(Zone *zone, uint64_t length);
+  void RecordExtentInvalidated(Zone *zone, uint64_t length);
 
   int Read(char *buf, uint64_t offset, int n, bool direct);
   IOStatus InvalidateCache(uint64_t pos, uint64_t size);

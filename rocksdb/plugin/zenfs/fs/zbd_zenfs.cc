@@ -61,6 +61,7 @@ Zone::Zone(ZonedBlockDevice *zbd, ZonedBlockDeviceBackend *zbd_be,
   capacity_ = 0;
   if (zbd_be->ZoneIsWritable(zones, idx))
     capacity_ = max_capacity_ - (wp_ - start_);
+  frag_stats_.zone_id = GetZoneNr();
 }
 
 bool Zone::IsUsed() { return (used_capacity_ > 0); }
@@ -97,6 +98,7 @@ IOStatus Zone::Reset() {
 
   wp_ = start_;
   lifetime_ = Env::WLTH_NOT_SET;
+  zbd_->RecordZoneReset(this);
 
   return IOStatus::OK();
 }
@@ -148,6 +150,7 @@ IOStatus Zone::Append(char *data, uint32_t size) {
     capacity_ -= ret;
     left -= ret;
     zbd_->AddBytesWritten(ret);
+    zbd_->RecordZoneWrite(this, ret);
   }
 
   return IOStatus::OK();
@@ -174,6 +177,14 @@ ZonedBlockDevice::ZonedBlockDevice(std::string path, ZbdBackendType backend,
                                    std::shared_ptr<Logger> logger,
                                    std::shared_ptr<ZenFSMetrics> metrics)
     : logger_(logger), metrics_(metrics) {
+  const char *stats_path = getenv("ZENFS_FRAGSENSE_STATS_PATH");
+  const char *observe = getenv("ZENFS_FRAGSENSE_OBSERVE");
+  const char *observe_dir = getenv("ZENFS_FRAGSENSE_OBSERVE_DIR");
+  fragsense_stats_enabled_ =
+      (stats_path != nullptr && stats_path[0] != '\0') ||
+      (observe != nullptr && strcmp(observe, "1") == 0 &&
+       observe_dir != nullptr && observe_dir[0] != '\0');
+
   if (backend == ZbdBackendType::kBlockDev) {
     zbd_be_ = std::unique_ptr<ZbdlibBackend>(new ZbdlibBackend(path));
     Info(logger_, "New Zoned Block Device: %s", zbd_be_->GetFilename().c_str());
@@ -873,6 +884,46 @@ void ZonedBlockDevice::SetZoneDeferredStatus(IOStatus status) {
   if (!zone_deferred_status_.ok()) {
     zone_deferred_status_ = status;
   }
+}
+
+void ZonedBlockDevice::RecordZoneWrite(Zone *zone, uint64_t /*bytes*/) {
+  if (!fragsense_stats_enabled_ || zone == nullptr) return;
+
+  uint64_t seq = ++fragsense_seq_;
+  uint64_t now_ms = Env::Default()->NowMicros() / 1000;
+  uint64_t expected = 0;
+  zone->frag_stats_.first_write_ms.compare_exchange_strong(expected, now_ms);
+  zone->frag_stats_.last_write_seq.store(seq);
+}
+
+void ZonedBlockDevice::RecordZoneReset(Zone *zone) {
+  if (!fragsense_stats_enabled_ || zone == nullptr) return;
+
+  uint64_t seq = ++fragsense_seq_;
+  zone->frag_stats_.extent_count_total.store(0);
+  zone->frag_stats_.first_write_ms.store(0);
+  zone->frag_stats_.last_write_seq.store(0);
+  zone->frag_stats_.last_invalidate_seq.store(seq);
+  zone->frag_stats_.reset_count.fetch_add(1);
+}
+
+void ZonedBlockDevice::RecordExtentCreated(Zone *zone, uint64_t /*length*/) {
+  if (!fragsense_stats_enabled_ || zone == nullptr) return;
+
+  zone->frag_stats_.extent_count_total.fetch_add(1);
+  uint64_t seq = ++fragsense_seq_;
+  uint64_t now_ms = Env::Default()->NowMicros() / 1000;
+  uint64_t expected = 0;
+  zone->frag_stats_.first_write_ms.compare_exchange_strong(expected, now_ms);
+  zone->frag_stats_.last_write_seq.store(seq);
+}
+
+void ZonedBlockDevice::RecordExtentInvalidated(Zone *zone,
+                                               uint64_t /*length*/) {
+  if (!fragsense_stats_enabled_ || zone == nullptr) return;
+
+  uint64_t seq = ++fragsense_seq_;
+  zone->frag_stats_.last_invalidate_seq.store(seq);
 }
 
 void ZonedBlockDevice::GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot) {

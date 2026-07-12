@@ -12,10 +12,16 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mntent.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <fstream>
+#include <iomanip>
+#include <map>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -32,6 +38,105 @@
 #define DEFAULT_ZENV_LOG_PATH "/tmp/"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+bool FragSenseEnvFlagEnabled(const char* value) {
+  return value != nullptr && strcmp(value, "1") == 0;
+}
+
+bool FragSenseParseUInt64(const char* value, uint64_t* out) {
+  if (value == nullptr || value[0] == '\0') return false;
+  char* end = nullptr;
+  uint64_t parsed = strtoull(value, &end, 10);
+  if (end == value || parsed == 0) return false;
+  *out = parsed;
+  return true;
+}
+
+bool FragSenseParseDouble(const char* value, double* out) {
+  if (value == nullptr || value[0] == '\0') return false;
+  char* end = nullptr;
+  double parsed = strtod(value, &end);
+  if (end == value || parsed < 0.0) return false;
+  *out = parsed;
+  return true;
+}
+
+std::string FragSenseJoinPath(const std::string& dir,
+                              const std::string& filename) {
+  if (dir.empty()) return filename;
+  if (dir.back() == '/') return dir + filename;
+  return dir + "/" + filename;
+}
+
+bool FragSenseCreateDirRecursive(const std::string& dir) {
+  if (dir.empty()) return false;
+
+  std::string current;
+  size_t pos = 0;
+  if (dir[0] == '/') {
+    current = "/";
+    pos = 1;
+  }
+
+  while (pos <= dir.size()) {
+    size_t next = dir.find('/', pos);
+    std::string part = dir.substr(pos, next == std::string::npos
+                                           ? std::string::npos
+                                           : next - pos);
+    if (!part.empty()) {
+      if (!current.empty() && current.back() != '/') current += "/";
+      current += part;
+      if (mkdir(current.c_str(), 0755) != 0 && errno != EEXIST) return false;
+    }
+    if (next == std::string::npos) break;
+    pos = next + 1;
+  }
+
+  return true;
+}
+
+std::string FragSenseJsonEscape(const std::string& value) {
+  std::ostringstream escaped;
+  for (char c : value) {
+    switch (c) {
+      case '\\':
+        escaped << "\\\\";
+        break;
+      case '"':
+        escaped << "\\\"";
+        break;
+      case '\n':
+        escaped << "\\n";
+        break;
+      case '\r':
+        escaped << "\\r";
+        break;
+      case '\t':
+        escaped << "\\t";
+        break;
+      default:
+        escaped << c;
+    }
+  }
+  return escaped.str();
+}
+
+std::string FragSenseReadCommandOutput(const char* command) {
+  std::string output;
+  FILE* pipe = popen(command, "r");
+  if (pipe == nullptr) return output;
+
+  char buffer[256];
+  while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+    output += buffer;
+  }
+  pclose(pipe);
+  return output;
+}
+
+}  // namespace
 
 Status Superblock::DecodeFrom(Slice* input) {
   if (input->size() != ENCODED_SIZE) {
@@ -256,6 +361,7 @@ ZenFS::ZenFS(ZonedBlockDevice* zbd, std::shared_ptr<FileSystem> aux_fs,
 ZenFS::~ZenFS() {
   Status s;
   Info(logger_, "ZenFS shutting down");
+  StopFragSenseStatsWorker();
   zbd_->LogZoneUsage();
   LogFiles();
 
@@ -267,6 +373,314 @@ ZenFS::~ZenFS() {
   meta_log_.reset(nullptr);
   ClearFiles();
   delete zbd_;
+}
+
+void ZenFS::MaybeStartFragSenseStatsWorker() {
+  const char* observe = getenv("ZENFS_FRAGSENSE_OBSERVE");
+  const char* observe_dir = getenv("ZENFS_FRAGSENSE_OBSERVE_DIR");
+  const char* stats_path = getenv("ZENFS_FRAGSENSE_STATS_PATH");
+
+  if (FragSenseEnvFlagEnabled(observe)) {
+    if (observe_dir == nullptr || observe_dir[0] == '\0') {
+      Warn(logger_,
+           "FragSense observer requested but "
+           "ZENFS_FRAGSENSE_OBSERVE_DIR is unset");
+      return;
+    }
+    fragsense_observer_mode_ = true;
+    fragsense_observe_dir_ = observe_dir;
+    if (!FragSenseCreateDirRecursive(fragsense_observe_dir_)) {
+      Warn(logger_, "FragSense: failed to create observer directory: %s",
+           fragsense_observe_dir_.c_str());
+      return;
+    }
+    fragsense_stats_path_ =
+        FragSenseJoinPath(fragsense_observe_dir_, "zone_snapshot.csv");
+  } else {
+    if (stats_path == nullptr || stats_path[0] == '\0') return;
+    fragsense_observer_mode_ = false;
+    fragsense_stats_path_ = stats_path;
+  }
+
+  const char* interval =
+      fragsense_observer_mode_ ? getenv("ZENFS_FRAGSENSE_OBSERVE_INTERVAL_MS")
+                               : getenv("ZENFS_FRAGSENSE_STATS_INTERVAL_MS");
+  FragSenseParseUInt64(interval, &fragsense_stats_interval_ms_);
+
+  if (fragsense_observer_mode_) {
+    FragSenseParseDouble(getenv("ZENFS_FRAGSENSE_BLOCKED_INVALID_RATIO"),
+                         &fragsense_blocked_invalid_ratio_);
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(fragsense_stats_dump_mtx_);
+    std::ofstream out(fragsense_stats_path_, std::ios::out | std::ios::trunc);
+    if (!out.is_open()) {
+      Warn(logger_, "FragSense: failed to open zone stats CSV: %s",
+           fragsense_stats_path_.c_str());
+      fragsense_stats_path_.clear();
+      return;
+    }
+
+    if (fragsense_observer_mode_) {
+      out << "ts_us,sample_id,zone_id,zone_state,is_empty,is_open,"
+             "is_active,is_full,is_sealed,capacity_bytes,written_bytes,"
+             "used_capacity_bytes,live_bytes,invalid_bytes,valid_ratio,"
+             "invalid_ratio,reclaimable_ratio,live_extent_count,"
+             "file_extent_count,segments,avg_segment_bytes,frag,age_sec,"
+             "resettable,blocked,free_zone_count,open_zone_count,"
+             "active_zone_count,reset_count\n";
+    } else {
+      out << "timestamp_ms,seq,zone_id,state,capacity_bytes,wp_bytes,"
+             "live_bytes,invalid_bytes,live_extent_count,extent_count_total,"
+             "live_file_count,live_segment_count,hole_count,"
+             "avg_live_extent_size,frag_score,lifetime_hint,age_ms,"
+             "last_write_seq,last_invalidate_seq,reset_count\n";
+    }
+  }
+
+  if (fragsense_observer_mode_) {
+    WriteFragSenseObserverMetadata();
+  }
+
+  run_fragsense_stats_worker_ = true;
+  fragsense_stats_worker_.reset(
+      new std::thread(&ZenFS::FragSenseStatsWorker, this));
+}
+
+void ZenFS::StopFragSenseStatsWorker() {
+  run_fragsense_stats_worker_ = false;
+  if (fragsense_stats_worker_ && fragsense_stats_worker_->joinable()) {
+    fragsense_stats_worker_->join();
+  }
+  fragsense_stats_worker_.reset(nullptr);
+}
+
+void ZenFS::WriteFragSenseObserverMetadata() {
+  if (!fragsense_observer_mode_ || fragsense_observe_dir_.empty()) return;
+
+  std::string metadata_path =
+      FragSenseJoinPath(fragsense_observe_dir_, "experiment_metadata.json");
+  std::ofstream out(metadata_path, std::ios::out | std::ios::trunc);
+  if (!out.is_open()) {
+    Warn(logger_, "FragSense: failed to open observer metadata JSON: %s",
+         metadata_path.c_str());
+    return;
+  }
+
+  const char* observe = getenv("ZENFS_FRAGSENSE_OBSERVE");
+  const char* observe_dir = getenv("ZENFS_FRAGSENSE_OBSERVE_DIR");
+  const char* observe_interval =
+      getenv("ZENFS_FRAGSENSE_OBSERVE_INTERVAL_MS");
+  const char* blocked_threshold =
+      getenv("ZENFS_FRAGSENSE_BLOCKED_INVALID_RATIO");
+
+  out << "{\n";
+  out << "  \"timestamp_us\": " << Env::Default()->NowMicros() << ",\n";
+  out << "  \"git_commit\": \""
+      << FragSenseJsonEscape(
+             FragSenseReadCommandOutput("git rev-parse HEAD 2>/dev/null"))
+      << "\",\n";
+  out << "  \"git_status_porcelain\": \""
+      << FragSenseJsonEscape(
+             FragSenseReadCommandOutput("git status --porcelain 2>/dev/null"))
+      << "\",\n";
+  out << "  \"build_flags\": {\n";
+  out << "    \"zenfs_version\": \"" << FragSenseJsonEscape(ZENFS_VERSION)
+      << "\",\n";
+  out << "    \"compiler\": \"" << FragSenseJsonEscape(__VERSION__)
+      << "\",\n";
+  out << "    \"build_date\": \"" << __DATE__ << " " << __TIME__
+      << "\",\n";
+#ifdef NDEBUG
+  out << "    \"ndebug\": true,\n";
+#else
+  out << "    \"ndebug\": false,\n";
+#endif
+#ifdef ZENFS_EXPORT_PROMETHEUS
+  out << "    \"zenfs_export_prometheus\": true\n";
+#else
+  out << "    \"zenfs_export_prometheus\": false\n";
+#endif
+  out << "  },\n";
+  out << "  \"observer_env\": {\n";
+  out << "    \"ZENFS_FRAGSENSE_OBSERVE\": \""
+      << FragSenseJsonEscape(observe == nullptr ? "" : observe) << "\",\n";
+  out << "    \"ZENFS_FRAGSENSE_OBSERVE_DIR\": \""
+      << FragSenseJsonEscape(observe_dir == nullptr ? "" : observe_dir)
+      << "\",\n";
+  out << "    \"ZENFS_FRAGSENSE_OBSERVE_INTERVAL_MS\": \""
+      << FragSenseJsonEscape(observe_interval == nullptr ? ""
+                                                        : observe_interval)
+      << "\",\n";
+  out << "    \"ZENFS_FRAGSENSE_BLOCKED_INVALID_RATIO\": \""
+      << FragSenseJsonEscape(blocked_threshold == nullptr ? ""
+                                                          : blocked_threshold)
+      << "\",\n";
+  out << "    \"effective_interval_ms\": "
+      << fragsense_stats_interval_ms_ << ",\n";
+  out << "    \"effective_blocked_invalid_ratio\": "
+      << fragsense_blocked_invalid_ratio_ << "\n";
+  out << "  }\n";
+  out << "}\n";
+}
+
+void ZenFS::FragSenseStatsWorker() {
+  while (run_fragsense_stats_worker_) {
+    DumpZoneFragStats();
+    usleep(fragsense_stats_interval_ms_ * 1000);
+  }
+}
+
+void ZenFS::DumpZoneFragStats() {
+  if (fragsense_stats_path_.empty()) return;
+
+  struct ZoneFragAggregate {
+    uint64_t live_extent_count = 0;
+    uint64_t live_segment_count = 0;
+    std::set<std::string> live_files;
+    std::vector<std::pair<uint64_t, uint64_t>> live_ranges;
+  };
+
+  ZenFSSnapshot snapshot;
+  ZenFSSnapshotOptions options;
+  options.zone_ = 1;
+  options.zone_file_ = 1;
+  GetZenFSSnapshot(snapshot, options);
+
+  std::map<uint64_t, ZoneFragAggregate> aggregate_by_zone;
+  for (const auto& extent : snapshot.extents_) {
+    ZoneFragAggregate& aggregate = aggregate_by_zone[extent.zone_start];
+    aggregate.live_extent_count++;
+    aggregate.live_files.insert(extent.filename);
+    aggregate.live_ranges.emplace_back(extent.start,
+                                       extent.start + extent.length);
+  }
+
+  for (auto& entry : aggregate_by_zone) {
+    ZoneFragAggregate& aggregate = entry.second;
+    std::sort(aggregate.live_ranges.begin(), aggregate.live_ranges.end());
+
+    uint64_t current_end = 0;
+    for (const auto& range : aggregate.live_ranges) {
+      if (aggregate.live_segment_count == 0 || range.first > current_end) {
+        aggregate.live_segment_count++;
+        current_end = range.second;
+      } else if (range.second > current_end) {
+        current_end = range.second;
+      }
+    }
+  }
+
+  uint64_t timestamp_us = Env::Default()->NowMicros();
+  uint64_t timestamp_ms = timestamp_us / 1000;
+  uint64_t seq = zbd_->GetFragSenseSeq();
+  uint64_t sample_id = ++fragsense_sample_id_;
+
+  uint64_t free_zone_count = 0;
+  uint64_t open_zone_count = 0;
+  uint64_t active_zone_count = 0;
+  for (const auto& zone : snapshot.zones_) {
+    if (zone.is_empty) free_zone_count++;
+    if (zone.is_open) open_zone_count++;
+    if (zone.is_active) active_zone_count++;
+  }
+
+  std::lock_guard<std::mutex> lock(fragsense_stats_dump_mtx_);
+  std::ofstream out(fragsense_stats_path_, std::ios::out | std::ios::app);
+  if (!out.is_open()) return;
+  out << std::setprecision(17);
+
+  for (const auto& zone : snapshot.zones_) {
+    auto aggregate_it = aggregate_by_zone.find(zone.start);
+    ZoneFragAggregate empty_aggregate;
+    const ZoneFragAggregate& aggregate =
+        aggregate_it == aggregate_by_zone.end() ? empty_aggregate
+                                                : aggregate_it->second;
+
+    const char* state = "active";
+    if (zone.is_empty) {
+      state = "empty";
+    } else if (zone.is_sealed) {
+      state = "sealed";
+    } else if (zone.is_open) {
+      state = "open";
+    } else if (zone.is_full) {
+      state = "full";
+    }
+
+    uint64_t wp_bytes = zone.wp > zone.start ? zone.wp - zone.start : 0;
+    uint64_t written_bytes =
+        zone.max_capacity > zone.capacity ? zone.max_capacity - zone.capacity
+                                          : 0;
+    written_bytes = std::max(written_bytes, std::min(wp_bytes,
+                                                     zone.max_capacity));
+
+    uint64_t live_bytes = zone.used_capacity;
+    uint64_t invalid_bytes =
+        written_bytes > live_bytes ? written_bytes - live_bytes : 0;
+    uint64_t live_extent_count = aggregate.live_extent_count;
+    uint64_t live_segment_count = aggregate.live_segment_count;
+    uint64_t hole_count =
+        live_segment_count > 0 ? live_segment_count - 1 : 0;
+    double avg_live_extent_size =
+        live_extent_count == 0
+            ? 0.0
+            : static_cast<double>(live_bytes) / live_extent_count;
+    double avg_segment_bytes =
+        live_segment_count == 0
+            ? 0.0
+            : static_cast<double>(live_bytes) / live_segment_count;
+    double frag_score =
+        live_extent_count == 0
+            ? 0.0
+            : static_cast<double>(live_segment_count) / live_extent_count;
+    uint64_t age_ms =
+        zone.first_write_ms == 0 || timestamp_ms < zone.first_write_ms
+            ? 0
+            : timestamp_ms - zone.first_write_ms;
+    double valid_ratio =
+        written_bytes == 0 ? 0.0
+                           : static_cast<double>(live_bytes) / written_bytes;
+    double invalid_ratio =
+        written_bytes == 0 ? 0.0
+                           : static_cast<double>(invalid_bytes) /
+                                 written_bytes;
+    double reclaimable_ratio =
+        zone.max_capacity == 0
+            ? 0.0
+            : static_cast<double>(invalid_bytes) / zone.max_capacity;
+    bool resettable = live_bytes == 0;
+    bool blocked = zone.is_sealed && live_bytes > 0 &&
+                   invalid_ratio >= fragsense_blocked_invalid_ratio_;
+
+    if (fragsense_observer_mode_) {
+      out << timestamp_us << "," << sample_id << "," << zone.zone_id << ","
+          << state << "," << (zone.is_empty ? 1 : 0) << ","
+          << (zone.is_open ? 1 : 0) << "," << (zone.is_active ? 1 : 0)
+          << "," << (zone.is_full ? 1 : 0) << ","
+          << (zone.is_sealed ? 1 : 0) << "," << zone.max_capacity << ","
+          << written_bytes << "," << zone.used_capacity << ","
+          << live_bytes << "," << invalid_bytes << "," << valid_ratio << ","
+          << invalid_ratio << "," << reclaimable_ratio << ","
+          << live_extent_count << "," << zone.extent_count_total << ","
+          << live_segment_count << "," << avg_segment_bytes << ","
+          << frag_score << "," << static_cast<double>(age_ms) / 1000.0
+          << "," << (resettable ? 1 : 0) << "," << (blocked ? 1 : 0)
+          << "," << free_zone_count << "," << open_zone_count << ","
+          << active_zone_count << "," << zone.reset_count << "\n";
+    } else {
+      out << timestamp_ms << "," << seq << "," << zone.zone_id << ","
+          << state << "," << zone.max_capacity << "," << wp_bytes << ","
+          << live_bytes << "," << invalid_bytes << "," << live_extent_count
+          << "," << zone.extent_count_total << ","
+          << aggregate.live_files.size() << "," << live_segment_count << ","
+          << hole_count << "," << avg_live_extent_size << "," << frag_score
+          << "," << zone.lifetime_hint << "," << age_ms << ","
+          << zone.last_write_seq << "," << zone.last_invalidate_seq << ","
+          << zone.reset_count << "\n";
+    }
+  }
 }
 
 void ZenFS::GCWorker() {
@@ -496,6 +910,7 @@ IOStatus ZenFS::SyncFileExtents(ZoneFile* zoneFile,
     ZoneExtent* old_ext = old_extents[i];
     if (old_ext->start_ != new_extents[i]->start_) {
       old_ext->zone_->used_capacity_ -= old_ext->length_;
+      zbd_->RecordExtentInvalidated(old_ext->zone_, old_ext->length_);
     }
     delete old_ext;
   }
@@ -1489,6 +1904,7 @@ Status ZenFS::Mount(bool readonly) {
   }
 
   LogFiles();
+  MaybeStartFragSenseStatsWorker();
 
   return Status::OK();
 }
@@ -1845,6 +2261,7 @@ IOStatus ZenFS::MigrateFileExtents(
     ext->start_ = target_start;
     ext->zone_ = target_zone;
     ext->zone_->used_capacity_ += ext->length_;
+    zbd_->RecordExtentCreated(ext->zone_, ext->length_);
 
     zbd_->ReleaseMigrateZone(target_zone);
   }
