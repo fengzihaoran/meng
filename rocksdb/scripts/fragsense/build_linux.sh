@@ -215,7 +215,8 @@ exec > >(tee "$LOG_FILE") 2>&1
 
 CONFIGURE_CMD=(
   cmake -S "$SOURCE_DIR" -B "$BUILD_DIR"
-  -DCMAKE_BUILD_TYPE=Release
+  # RocksDB v8.11.3 forces WITH_TESTS=OFF for non-Debug configurations.
+  -DCMAKE_BUILD_TYPE=Debug
   -DROCKSDB_PLUGINS=zenfs
   -DWITH_GFLAGS=ON
   -DWITH_SNAPPY=ON
