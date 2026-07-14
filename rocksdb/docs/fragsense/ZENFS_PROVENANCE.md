@@ -113,6 +113,11 @@ separately. Run `scripts/fragsense/build_linux.sh --probe-only` before the build
 to verify which layout was detected. An untracked ZenFS directory without its
 own Git metadata is rejected rather than assigned fabricated provenance.
 
+The build gate also rejects a zero-test CTest discovery. CMake 3.16 does not
+reliably support the newer `ctest --test-dir` invocation used by the first
+script revision, so the script uses `cmake -E chdir <build> ctest ...` and
+records the discovered test count before execution.
+
 ## Existing optional active GC
 
 ### Enablement and trigger

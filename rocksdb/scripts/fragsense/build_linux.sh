@@ -141,6 +141,7 @@ require_command c++
 require_command ctest
 require_command nproc
 require_command pkg-config
+require_command sed
 require_command tee
 
 if [[ -z $BUILD_DIR ]]; then
@@ -172,11 +173,12 @@ mkdir -p -- "$EVIDENCE_DIR"
 
 STATUS_FILE="$EVIDENCE_DIR/status.txt"
 LOG_FILE="$EVIDENCE_DIR/build-and-test.log"
+FINAL_STATUS=PASSED
 on_exit() {
   rc=$?
   trap - EXIT
   if ((rc == 0)); then
-    printf 'PASSED\n' >"$STATUS_FILE"
+    printf '%s\n' "$FINAL_STATUS" >"$STATUS_FILE"
   else
     printf 'FAILED exit_code=%d\n' "$rc" >"$STATUS_FILE"
   fi
@@ -225,30 +227,53 @@ CONFIGURE_CMD=(
 BUILD_CMD=(
   cmake --build "$BUILD_DIR"
   --target rocksdb-shared zenfs_tool db_bench
+  db_basic_test env_basic_test c_test
   --parallel "$JOBS"
 )
+TEST_DISCOVERY_CMD=(
+  cmake -E chdir "$BUILD_DIR" ctest -N
+)
 TEST_CMD=(
-  ctest --test-dir "$BUILD_DIR" --output-on-failure
+  cmake -E chdir "$BUILD_DIR" ctest --output-on-failure
 )
 
 printf '%q ' "${CONFIGURE_CMD[@]}" >"$EVIDENCE_DIR/configure.command"
 printf '\n' >>"$EVIDENCE_DIR/configure.command"
 printf '%q ' "${BUILD_CMD[@]}" >"$EVIDENCE_DIR/build.command"
 printf '\n' >>"$EVIDENCE_DIR/build.command"
+printf '%q ' "${TEST_DISCOVERY_CMD[@]}" \
+  >"$EVIDENCE_DIR/test-discovery.command"
+printf '\n' >>"$EVIDENCE_DIR/test-discovery.command"
 printf '%q ' "${TEST_CMD[@]}" >"$EVIDENCE_DIR/test.command"
 printf '\n' >>"$EVIDENCE_DIR/test.command"
 
 printf 'fragsense: configuring clean Linux ZenFS build\n'
 "${CONFIGURE_CMD[@]}"
 
-printf 'fragsense: building rocksdb-shared, zenfs_tool, and db_bench\n'
+printf 'fragsense: building RocksDB/ZenFS tools and non-device tests\n'
 "${BUILD_CMD[@]}"
+printf 'PASSED\n' >"$EVIDENCE_DIR/build.status"
 
 if ((RUN_TESTS)); then
-  printf 'fragsense: running non-device CTest suite\n'
+  printf 'fragsense: discovering non-device CTest suite\n'
+  TEST_LISTING=$("${TEST_DISCOVERY_CMD[@]}")
+  printf '%s\n' "$TEST_LISTING" |
+    tee "$EVIDENCE_DIR/test-discovery.log"
+  TEST_COUNT=$(printf '%s\n' "$TEST_LISTING" |
+    sed -n 's/^Total Tests: \([0-9][0-9]*\)$/\1/p')
+  [[ $TEST_COUNT =~ ^[0-9]+$ ]] ||
+    die "could not parse CTest discovery count"
+  ((TEST_COUNT > 0)) || die "CTest discovered zero tests"
+  printf '%s\n' "$TEST_COUNT" >"$EVIDENCE_DIR/test-count.txt"
+  printf 'test_count=%s\n' "$TEST_COUNT" \
+    >>"$EVIDENCE_DIR/environment.txt"
+  printf 'fragsense: running %s discovered non-device tests\n' "$TEST_COUNT"
   "${TEST_CMD[@]}"
+  printf 'PASSED\n' >"$EVIDENCE_DIR/test.status"
 else
   printf 'fragsense: tests skipped by --skip-tests\n'
+  printf 'SKIPPED\n' >"$EVIDENCE_DIR/test.status"
+  FINAL_STATUS=BUILD_PASSED_TESTS_SKIPPED
 fi
 
 printf 'fragsense: evidence written to %s\n' "$EVIDENCE_DIR"

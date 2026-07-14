@@ -40,8 +40,11 @@ workflow. It rejects an untracked, non-repository `plugin/zenfs` directory
 because that layout cannot provide exact source provenance.
 
 The script performs a clean CMake configure and builds `rocksdb-shared`,
-`zenfs_tool`, and `db_bench`. It then runs the configured non-device CTest suite
-and saves commands, environment, repository state, logs, and final status under:
+`zenfs_tool`, `db_bench`, `db_basic_test`, `env_basic_test`, and `c_test`. It
+then discovers and runs the configured non-device CTest suite from the build
+directory. Zero discovered tests is a gate failure, not a pass. Commands,
+environment, repository state, logs, build/test statuses, and final status are
+saved under:
 
 ```text
 cmake-build-fragsense-m05/fragsense-m05-evidence/
@@ -63,6 +66,23 @@ The clean Linux build and CTest result remain open until the evidence directory
 from a Linux run is reviewed. Device integration and active-GC tests remain
 unrun because they are destructive and require an explicitly approved
 disposable target.
+
+### Rejected FEMU attempt: 2026-07-14
+
+The first FEMU run compiled `rocksdb-shared`, `zenfs_tool`, and `db_bench`, but
+does not satisfy the gate:
+
+- CTest printed `No tests were found!!!`; the old script incorrectly wrote
+  `PASSED` because CTest returned zero;
+- CMake/CTest 3.16 ran the old `--test-dir` invocation from the source directory
+  instead of the intended build directory;
+- RocksDB commit `c2467b141e840fdba5b3a1810763043e56449fb9` was detached and
+  had tracked/untracked source changes;
+- nested ZenFS commit `919c2ebbcdc170525a9abffb8b61a3795b1e6ae5` also had extensive
+  tracked/untracked changes.
+
+This is useful compile evidence for that dirty working tree, but it is not a
+reproducible clean-source M0.5 result. The gate remains `BLOCKED`.
 
 ## Unresolved blockers
 
