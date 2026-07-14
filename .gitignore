@@ -1292,6 +1292,13 @@
 /rocksdb/cmake-build-debug-femu/udt_util_test[1]_include.cmake
 /rocksdb/cmake-build-debug-femu/util_merge_operators_test[1]_include.cmake
 /rocksdb/cmake-build-debug-femu/version_set_test[1]_include.cmake
+
+# Repository-local generated artifacts
+**/__pycache__/
+*.py[cod]
+/rocksdb/cmake-build-fragsense-*/
+/rocksdb/docs/fragsense/*_bundle/
+/rocksdb/docs/fragsense/*_Bundle.zip
 /rocksdb/cmake-build-debug-femu/backup_engine_test[1]_include.cmake
 /rocksdb/cmake-build-debug-femu/blob_source_test[1]_include.cmake
 /rocksdb/cmake-build-debug-femu/block_based_table_reader_test[1]_include.cmake
