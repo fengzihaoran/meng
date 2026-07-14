@@ -13,6 +13,7 @@ Options:
   --jobs N           Parallel build jobs (default: nproc)
   --no-clean         Reuse the build directory instead of removing it first
   --skip-tests       Build targets but do not run ctest
+  --probe-only       Print RocksDB/ZenFS Git provenance and exit
   -h, --help         Show this help
 
 The script never runs zenfs mkfs, resets a Zone, or writes to a block device.
@@ -28,6 +29,50 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+detect_source_provenance() {
+  ROCKSDB_REPO_ROOT=$(git -C "$SOURCE_DIR" rev-parse --show-toplevel 2>/dev/null) ||
+    die "RocksDB source is not inside a Git worktree: $SOURCE_DIR"
+  ROCKSDB_REPO_ROOT=$(realpath -e -- "$ROCKSDB_REPO_ROOT")
+  ROCKSDB_GIT_PREFIX=$(git -C "$SOURCE_DIR" rev-parse --show-prefix)
+  ROCKSDB_COMMIT=$(git -C "$SOURCE_DIR" rev-parse HEAD)
+  ROCKSDB_BRANCH=$(git -C "$SOURCE_DIR" symbolic-ref --short -q HEAD ||
+    printf '%s' DETACHED)
+
+  ZENFS_GIT_PATH="${ROCKSDB_GIT_PREFIX}plugin/zenfs"
+  if git -C "$SOURCE_DIR" cat-file -e "HEAD:$ZENFS_GIT_PATH" 2>/dev/null; then
+    ZENFS_SOURCE_KIND=tracked-subtree
+    ZENFS_REPO_ROOT=$ROCKSDB_REPO_ROOT
+    ZENFS_COMMIT=$ROCKSDB_COMMIT
+    ZENFS_TREE=$(git -C "$SOURCE_DIR" rev-parse "HEAD:$ZENFS_GIT_PATH")
+    return
+  fi
+
+  local nested_root
+  nested_root=$(git -C "$SOURCE_DIR/plugin/zenfs" rev-parse --show-toplevel \
+    2>/dev/null) ||
+    die "plugin/zenfs is neither a tracked subtree nor an independent Git repository"
+  nested_root=$(realpath -e -- "$nested_root")
+  if [[ $nested_root == "$ROCKSDB_REPO_ROOT" ]]; then
+    die "plugin/zenfs exists but is untracked; exact ZenFS provenance cannot be recorded"
+  fi
+
+  ZENFS_SOURCE_KIND=nested-git
+  ZENFS_REPO_ROOT=$nested_root
+  ZENFS_GIT_PATH=.
+  ZENFS_COMMIT=$(git -C "$ZENFS_REPO_ROOT" rev-parse HEAD)
+  ZENFS_TREE=$(git -C "$ZENFS_REPO_ROOT" rev-parse 'HEAD^{tree}')
+}
+
+print_source_provenance() {
+  printf 'rocksdb_repo_root=%s\n' "$ROCKSDB_REPO_ROOT"
+  printf 'rocksdb_branch=%s\n' "$ROCKSDB_BRANCH"
+  printf 'rocksdb_commit=%s\n' "$ROCKSDB_COMMIT"
+  printf 'zenfs_source_kind=%s\n' "$ZENFS_SOURCE_KIND"
+  printf 'zenfs_repo_root=%s\n' "$ZENFS_REPO_ROOT"
+  printf 'zenfs_commit=%s\n' "$ZENFS_COMMIT"
+  printf 'zenfs_tree=%s\n' "$ZENFS_TREE"
+}
+
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DEFAULT_SOURCE_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 SOURCE_DIR=$DEFAULT_SOURCE_DIR
@@ -35,6 +80,7 @@ BUILD_DIR=
 JOBS=
 CLEAN=1
 RUN_TESTS=1
+PROBE_ONLY=0
 
 while (($# > 0)); do
   case "$1" in
@@ -61,6 +107,10 @@ while (($# > 0)); do
       RUN_TESTS=0
       shift
       ;;
+    --probe-only)
+      PROBE_ONLY=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -71,25 +121,27 @@ while (($# > 0)); do
   esac
 done
 
-[[ $(uname -s) == Linux ]] || die "this gate must run on Linux"
-
-require_command cmake
-require_command c++
-require_command ctest
 require_command git
-require_command nproc
-require_command pkg-config
 require_command realpath
-require_command tee
 
 SOURCE_DIR=$(realpath -e -- "$SOURCE_DIR")
 [[ -f "$SOURCE_DIR/CMakeLists.txt" ]] || die "not a RocksDB source tree: $SOURCE_DIR"
 [[ -f "$SOURCE_DIR/plugin/zenfs/CMakeLists.txt" ]] || die "ZenFS plugin missing under: $SOURCE_DIR"
 
-GIT_PREFIX=$(git -C "$SOURCE_DIR" rev-parse --show-prefix)
-ZENFS_GIT_PATH="${GIT_PREFIX}plugin/zenfs"
-git -C "$SOURCE_DIR" cat-file -e "HEAD:$ZENFS_GIT_PATH" ||
-  die "ZenFS subtree is not tracked at HEAD:$ZENFS_GIT_PATH"
+detect_source_provenance
+if ((PROBE_ONLY)); then
+  print_source_provenance
+  exit 0
+fi
+
+[[ $(uname -s) == Linux ]] || die "this gate must run on Linux"
+
+require_command cmake
+require_command c++
+require_command ctest
+require_command nproc
+require_command pkg-config
+require_command tee
 
 if [[ -z $BUILD_DIR ]]; then
   BUILD_DIR="$SOURCE_DIR/cmake-build-fragsense-m05"
@@ -138,11 +190,10 @@ exec > >(tee "$LOG_FILE") 2>&1
   printf 'timestamp_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'source_dir=%s\n' "$SOURCE_DIR"
   printf 'build_dir=%s\n' "$BUILD_DIR"
-  printf 'git_commit=%s\n' "$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+  print_source_provenance
   printf 'zenfs_upstream_candidate=%s\n' \
     '919c2ebbcdc170525a9abffb8b61a3795b1e6ae5'
   printf 'zenfs_git_path=%s\n' "$ZENFS_GIT_PATH"
-  printf 'zenfs_tree=%s\n' "$(git -C "$SOURCE_DIR" rev-parse "HEAD:$ZENFS_GIT_PATH")"
   printf 'kernel=%s\n' "$(uname -a)"
   printf 'compiler=%s\n' "$(c++ --version | head -n 1)"
   printf 'cmake=%s\n' "$(cmake --version | head -n 1)"
@@ -150,9 +201,14 @@ exec > >(tee "$LOG_FILE") 2>&1
   printf 'jobs=%s\n' "$JOBS"
   printf 'clean=%s\n' "$CLEAN"
   printf 'run_tests=%s\n' "$RUN_TESTS"
-  printf '%s\n' 'git_status_begin'
+  printf '%s\n' 'rocksdb_git_status_begin'
   git -C "$SOURCE_DIR" status --porcelain
-  printf '%s\n' 'git_status_end'
+  printf '%s\n' 'rocksdb_git_status_end'
+  if [[ $ZENFS_SOURCE_KIND == nested-git ]]; then
+    printf '%s\n' 'zenfs_git_status_begin'
+    git -C "$ZENFS_REPO_ROOT" status --porcelain
+    printf '%s\n' 'zenfs_git_status_end'
+  fi
 } >"$EVIDENCE_DIR/environment.txt"
 
 CONFIGURE_CMD=(

@@ -106,6 +106,13 @@ git diff --no-ext-diff --binary main HEAD -- rocksdb/plugin/zenfs \
 The generated patch files are evidence artifacts and must not be committed
 without review.
 
+The Linux build script also supports the official installation layout where
+`plugin/zenfs` is an independent nested Git repository. In that case the
+evidence records the RocksDB commit/status and the ZenFS commit/tree/status
+separately. Run `scripts/fragsense/build_linux.sh --probe-only` before the build
+to verify which layout was detected. An untracked ZenFS directory without its
+own Git metadata is rejected rather than assigned fabricated provenance.
+
 ## Existing optional active GC
 
 ### Enablement and trigger

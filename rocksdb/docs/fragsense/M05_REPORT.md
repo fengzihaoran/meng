@@ -30,8 +30,14 @@ Run on the FEMU/Ubuntu RocksDB checkout:
 
 ```bash
 cd /home/femu/rocksdb
+bash scripts/fragsense/build_linux.sh --probe-only
 bash scripts/fragsense/build_linux.sh --jobs "$(nproc)"
 ```
+
+The probe accepts ZenFS either as a tracked vendored subtree or as the
+independent nested Git repository used by the official ZenFS installation
+workflow. It rejects an untracked, non-repository `plugin/zenfs` directory
+because that layout cannot provide exact source provenance.
 
 The script performs a clean CMake configure and builds `rocksdb-shared`,
 `zenfs_tool`, and `db_bench`. It then runs the configured non-device CTest suite
